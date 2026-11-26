@@ -8,7 +8,7 @@ export function renderVendorInvitationAcceptedEmail(
 ): string {
   const greeting = recipientName ? `Hello ${recipientName},` : 'Hello,';
   const roleDisplay = role.charAt(0) + role.slice(1).toLowerCase();
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3033';
   const vendorUrl = `${frontendUrl}/console/${vendorSlug}`;
 
   const bodyHtml = `

@@ -11,7 +11,10 @@ import {
 
 /** Aligned with `LoanConfig` in `schema.prisma` — rates stored as % per period (0–999.99). */
 export class UpsertLoanConfigDto {
-  @ApiProperty({ example: 5.0, description: 'Interest % per period (0–999.99).' })
+  @ApiProperty({
+    example: 5.0,
+    description: 'Interest % per period (0–999.99).',
+  })
   @Type(() => Number)
   @IsNumber()
   @Min(0)
@@ -24,7 +27,10 @@ export class UpsertLoanConfigDto {
   @Min(1)
   repaymentPeriodDays!: number;
 
-  @ApiProperty({ example: false, description: 'Allow loans above the member’s contribution.' })
+  @ApiProperty({
+    example: false,
+    description: 'Allow loans above the member’s contribution.',
+  })
   @IsBoolean()
   allowExceedContribution!: boolean;
 
@@ -46,7 +52,8 @@ export class UpsertLoanConfigDto {
 
   @ApiPropertyOptional({
     example: 1.5,
-    description: 'Penalty % per period when overdue; omit to disable (nullable in DB).',
+    description:
+      'Penalty % per period when overdue; omit to disable (nullable in DB).',
   })
   @IsOptional()
   @Type(() => Number)
@@ -55,9 +62,44 @@ export class UpsertLoanConfigDto {
   @Max(999.99)
   penaltyRate?: number;
 
-  @ApiProperty({ example: 7, description: 'Days after due before penalties apply.' })
+  @ApiProperty({
+    example: 7,
+    description: 'Days after due before penalties apply.',
+  })
   @Type(() => Number)
   @IsInt()
   @Min(0)
   gracePeriodDays!: number;
+
+  @ApiPropertyOptional({
+    example: 30,
+    description:
+      'Penalty is charged once per this many overdue days (default 30).',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(365)
+  penaltyPeriodDays?: number;
+
+  @ApiPropertyOptional({
+    example: 90,
+    description:
+      'Mark the loan DEFAULTED this many days after due date + grace; omit/null = never automatically.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  defaultAfterDays?: number | null;
+
+  @ApiPropertyOptional({
+    example: true,
+    description:
+      'Refuse loan requests while the member has late contributions or open fines (default true).',
+  })
+  @IsOptional()
+  @IsBoolean()
+  blockIfArrears?: boolean;
 }

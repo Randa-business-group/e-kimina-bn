@@ -24,10 +24,65 @@ enum GroupRemovalKind {
   SUSPENDED
 }
 
+/// PENDING: not paid, not overdue · PARTIALLY_PAID: some money allocated, not overdue
+/// LATE: past dueDate + grace and not fully paid (see `amountPaid`) · PAID: fully paid
 enum ContributionStatus {
   PENDING
+  PARTIALLY_PAID
   PAID
   LATE
+}
+
+enum GroupVerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum FineType {
+  LATE_CONTRIBUTION
+  LATE_LOAN
+  ABSENCE
+  MISCONDUCT
+  OTHER
+}
+
+enum FineStatus {
+  OPEN
+  PAID
+  WAIVED
+}
+
+/// What a deposit was meant to pay. Actual split is in `DepositAllocation`.
+enum DepositPurpose {
+  /// Open fines + contribution periods (oldest first)
+  CONTRIBUTION
+  /// One member loan (penalty first, then balance)
+  LOAN_REPAYMENT
+  /// Fines + contributions, then the member's open loan
+  COMBINED
+}
+
+enum AllocationKind {
+  CONTRIBUTION
+  FINE
+  LOAN_PENALTY
+  LOAN_REPAYMENT
+}
+
+enum LoanDisbursementMethod {
+  MTN_MOMO
+  CASH
+  BANK_TRANSFER
+  /// Approved in-app with no payout rail (legacy behaviour / payouts handled off-platform)
+  RECORDED
+}
+
+enum LoanDisbursementStatus {
+  PENDING
+  COMPLETED
+  FAILED
 }
 
 enum ContributionInterval {
@@ -47,6 +102,7 @@ enum MemberLoanStatus {
   ACTIVE
   REPAID
   DEFAULTED
+  WRITTEN_OFF
 }
 
 /// In-app user notifications (per-user rows; `audience` allows filtering by member vs admin vs treasurer).
@@ -83,12 +139,39 @@ enum NotificationType {
   NEW_GROUP_MEMBER
   /// Invited by email but must still complete registration (stored for when they log in)
   GROUP_INVITATION_PENDING
+  /// Contribution period is due soon (scheduler reminder)
+  CONTRIBUTION_DUE_SOON
+  /// Contribution passed due date + grace and is now late
+  CONTRIBUTION_LATE
+  /// A fine was issued (system late fine or by a leader)
+  FINE_ISSUED
+  /// A fine was waived by a leader
+  FINE_WAIVED
+  /// Loan passed its due date + grace; penalty applied
+  LOAN_PENALTY_APPLIED
+  /// Loan marked as defaulted
+  LOAN_DEFAULTED
+  /// Loan written off by leadership
+  LOAN_WRITTEN_OFF
+  /// Loan due date extended (restructure)
+  LOAN_EXTENDED
+  /// MoMo payment failed or was declined
+  DEPOSIT_FAILED
+  /// MoMo loan payout failed; leaders must retry or record a manual payout
+  LOAN_DISBURSEMENT_FAILED
+  /// Group admin requested verification (super admins)
+  GROUP_VERIFICATION_REQUESTED
+  /// Group verified by a super admin
+  GROUP_VERIFIED
+  /// Group verification rejected by a super admin
+  GROUP_VERIFICATION_REJECTED
 }
 
 enum NotificationAudience {
   MEMBER
   GROUP_ADMIN
   TREASURER
+  SUPER_ADMIN
 }
 
 enum DepositPaymentMethod {
@@ -97,10 +180,13 @@ enum DepositPaymentMethod {
 }
 
 enum DepositRecordStatus {
+  /// MoMo request-to-pay sent; waiting for the payer to approve on their phone
   PENDING
   PENDING_VERIFICATION
   CONFIRMED
   REJECTED
+  /// MoMo request failed, was declined or expired
+  FAILED
 }
 
 model User {
@@ -135,6 +221,7 @@ model User {
   memberLoans         MemberLoan[]
   depositRecords      DepositRecord[]
   depositReviews    DepositRecord[] @relation("DepositReviewedBy")
+  fines             Fine[]
 
   @@map("users")
 }
@@ -145,7 +232,21 @@ model Group {
   description String?
   isPublic    Boolean @default(false)
   createdById String
-  isVerified  Boolean  @default(true)
+  /// Kept in sync with `verificationStatus == VERIFIED` (used by finance guards).
+  isVerified  Boolean  @default(false)
+
+  verificationStatus          GroupVerificationStatus @default(UNVERIFIED)
+  verificationRequestedAt     DateTime?
+  /// District, sector, leader IDs, document URLs… submitted by the group admin.
+  verificationDetails         Json?
+  verificationReviewedAt      DateTime?
+  verificationReviewedById    String?
+  verificationRejectionReason String?
+
+  /// Soft delete: hidden from everyone but super admins; history is kept.
+  deletedAt      DateTime?
+  deletedById    String?
+  deletionReason String?
 
   minMembers  Int
   createdAt   DateTime @default(now())
@@ -162,8 +263,12 @@ model Group {
   memberLoans         MemberLoan[]
   depositRecords       DepositRecord[]
   userNotifications    UserNotification[]
+  fines                Fine[]
+  loanDisbursements    LoanDisbursement[]
 
   @@index([createdById])
+  @@index([verificationStatus])
+  @@index([deletedAt])
   @@map("groups")
 }
 
@@ -173,20 +278,87 @@ model Contribution {
   groupId   String
 
   amount    Decimal  @db.Decimal(10, 2)
+  /// Money allocated so far (partial payments); equals `amount` when PAID.
+  amountPaid Decimal @default(0) @db.Decimal(10, 2)
   dueDate   DateTime
   paidAt    DateTime?
 
   status    ContributionStatus @default(PENDING)
+  /// Set by the scheduler when the row turns LATE.
+  lateMarkedAt   DateTime?
+  /// Set when the "due soon" reminder was sent (dedupe).
+  reminderSentAt DateTime?
 
   createdAt DateTime @default(now())
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  fine        Fine?
+  allocations DepositAllocation[]
 
   @@unique([userId, groupId, dueDate])
   @@index([groupId, dueDate])
+  @@index([groupId, status, dueDate])
 
   @@map("contributions")
+}
+
+/// A fine owed by a member. Late-contribution fines are issued by the scheduler with the
+/// rate in force at that moment (later rate changes do not rewrite them).
+model Fine {
+  id             String     @id @default(cuid())
+  groupId        String
+  userId         String
+  type           FineType
+  amount         Decimal    @db.Decimal(10, 2)
+  amountPaid     Decimal    @default(0) @db.Decimal(10, 2)
+  currency       String     @default("RWF")
+  reason         String
+  status         FineStatus @default(OPEN)
+  /// One late fine per contribution period.
+  contributionId String?    @unique
+  memberLoanId   String?
+  /// null = issued by the system scheduler
+  issuedById     String?
+  waivedById     String?
+  waivedReason   String?
+  waivedAt       DateTime?
+  paidAt         DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  group        Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contribution Contribution? @relation(fields: [contributionId], references: [id], onDelete: SetNull)
+  memberLoan   MemberLoan?   @relation(fields: [memberLoanId], references: [id], onDelete: SetNull)
+  allocations  DepositAllocation[]
+
+  @@index([groupId, userId, status])
+  @@index([groupId, status, createdAt])
+  @@map("fines")
+}
+
+/// Where each franc of a confirmed deposit went. Sum of rows == deposit.amount.
+model DepositAllocation {
+  id             String         @id @default(cuid())
+  depositId      String
+  kind           AllocationKind
+  amount         Decimal        @db.Decimal(10, 2)
+  contributionId String?
+  fineId         String?
+  memberLoanId   String?
+  createdAt      DateTime       @default(now())
+
+  deposit      DepositRecord @relation(fields: [depositId], references: [id], onDelete: Cascade)
+  contribution Contribution? @relation(fields: [contributionId], references: [id], onDelete: SetNull)
+  fine         Fine?         @relation(fields: [fineId], references: [id], onDelete: SetNull)
+  memberLoan   MemberLoan?   @relation(fields: [memberLoanId], references: [id], onDelete: SetNull)
+
+  @@index([depositId])
+  @@index([contributionId])
+  @@index([fineId])
+  @@index([memberLoanId])
+  @@map("deposit_allocations")
 }
 
 model ContributionConfig {
@@ -207,6 +379,8 @@ model ContributionConfig {
   allowPartialPayments Boolean @default(false)
   latePenaltyRate      Decimal? @db.Decimal(5,2)
   gracePeriodDays      Int @default(0)
+  /// In-app reminder this many days before each due date (0 = off).
+  reminderDaysBefore   Int @default(1)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -346,8 +520,14 @@ model LoanConfig {
 
   allowPartialPayments    Boolean  @default(true)
 
+  /// % of the outstanding balance added once per `penaltyPeriodDays` while overdue (after grace).
   penaltyRate             Decimal? @db.Decimal(5, 2)
   gracePeriodDays         Int      @default(0)
+  penaltyPeriodDays       Int      @default(30)
+  /// Mark the loan DEFAULTED this many days after dueDate + grace (null = never automatically).
+  defaultAfterDays        Int?
+  /// Refuse new loan applications while the member has LATE contributions or open fines.
+  blockIfArrears          Boolean  @default(true)
 
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
@@ -410,8 +590,18 @@ model MemberLoan {
   disbursedAt                 DateTime @default(now())
   dueDate                     DateTime
   status                      MemberLoanStatus @default(ACTIVE)
-  /// Server-maintained late/overdue fee bucket (e.g. when past due with penalty rules).
+  /// Late penalty bucket, increased by the daily job (see `LoanConfig.penaltyRate`); paid first.
   penaltyAccrued              Decimal  @default(0) @db.Decimal(10, 2)
+  /// Number of overdue penalty periods already charged (idempotent accrual).
+  penaltyPeriodsApplied       Int      @default(0)
+  lastPenaltyAt               DateTime?
+  defaultedAt                 DateTime?
+  /// Due date before the first extension (restructure).
+  originalDueDate             DateTime?
+  writtenOffAt                DateTime?
+  writtenOffById              String?
+  writeOffReason              String?
+  writtenOffAmount            Decimal? @db.Decimal(10, 2)
   createdAt                   DateTime @default(now())
   updatedAt                   DateTime @updatedAt
 
@@ -419,9 +609,42 @@ model MemberLoan {
   group  Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
   application LoanApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   depositRecords DepositRecord[]
+  disbursement   LoanDisbursement?
+  allocations    DepositAllocation[]
+  fines          Fine[]
 
   @@index([groupId, userId, status])
+  @@index([status, dueDate])
   @@map("member_loans")
+}
+
+/// Payout of an approved loan. The loan term (dueDate) counts from `completedAt`.
+model LoanDisbursement {
+  id                    String                 @id @default(cuid())
+  memberLoanId          String                 @unique
+  groupId               String
+  amount                Decimal                @db.Decimal(10, 2)
+  currency              String                 @default("RWF")
+  method                LoanDisbursementMethod
+  status                LoanDisbursementStatus @default(PENDING)
+  phone                 String?
+  /// MoMo X-Reference-Id, or a bank / cash receipt reference.
+  reference             String?                @unique
+  providerTransactionId String?
+  providerStatus        String?
+  providerPayload       Json?
+  failureReason         String?
+  proofImageUrl         String?
+  disbursedById         String?
+  completedAt           DateTime?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  memberLoan MemberLoan @relation(fields: [memberLoanId], references: [id], onDelete: Cascade)
+  group      Group      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, status])
+  @@map("loan_disbursements")
 }
 
 /// Record of a member deposit intent (e.g. MoMo push or manual); amounts split for UI/audit.
@@ -444,13 +667,25 @@ model DepositRecord {
   reviewedByUserId      String?
   createdAt             DateTime               @default(now())
 
-  /// When set, this payment applies to `MemberLoan` repayment (not group contribution rules).
+  purpose               DepositPurpose         @default(CONTRIBUTION)
+  /// MTN MoMo X-Reference-Id (UUID) of the request-to-pay.
+  externalReference     String?                @unique
+  providerTransactionId String?
+  providerStatus        String?
+  providerPayload       Json?
+  /// Client-supplied key; a retry with the same key returns the same deposit.
+  idempotencyKey        String?                @unique
+  failureReason         String?
+
+  /// Loan this payment targets (LOAN_REPAYMENT, or COMBINED when the member has an open loan).
   memberLoanId String?
   user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   group      Group  @relation(fields: [groupId], references: [id], onDelete: Cascade)
   memberLoan  MemberLoan? @relation(fields: [memberLoanId], references: [id], onDelete: SetNull)
   reviewedBy User?  @relation("DepositReviewedBy", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  allocations DepositAllocation[]
 
+  @@index([status, paymentMethod, createdAt])
   @@index([groupId, status])
   @@index([groupId, userId])
   @@index([memberLoanId])

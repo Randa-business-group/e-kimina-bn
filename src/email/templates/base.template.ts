@@ -61,7 +61,7 @@ export function renderTemplate(
 
   const defaultOptions: TemplateOptions = {
     appName,
-    appUrl: process.env.APP_URL || 'http://localhost:4000',
+    appUrl: process.env.APP_URL || 'http://localhost:4033',
     year: new Date().getFullYear(),
     subject: `Email from ${appName}`,
     logoHtml,

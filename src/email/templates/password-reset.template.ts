@@ -23,7 +23,7 @@ export function renderPasswordResetEmail(
   );
 
   // Generate magic link URL
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3033';
   const encodedOtp = base64UrlEncode(otp);
   const encodedEmail = base64UrlEncode(email);
   const resetLink = `${frontendUrl}/reset-password?otp=${encodedOtp}&email=${encodedEmail}`;

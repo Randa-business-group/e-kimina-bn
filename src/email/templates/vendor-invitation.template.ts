@@ -9,7 +9,7 @@ export function renderVendorInvitationEmail(
   userExists: boolean = true,
 ): string {
   const greeting = recipientName ? `Hello ${recipientName},` : 'Hello,';
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3033';
   const acceptanceUrl = `${frontendUrl}/vendor-invitations/${invitationToken}/accept`;
   const registerUrl = `${frontendUrl}/register?invitation=${invitationToken}`;
 

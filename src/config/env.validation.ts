@@ -102,6 +102,26 @@ export function validateEnv(config: EnvRecord) {
     throw new Error(`NODE_ENV must be one of: ${allowedNodeEnvs.join(', ')}.`);
   }
 
+  const momoMode = config.MOMO_MODE;
+  if (
+    typeof momoMode === 'string' &&
+    momoMode.trim() !== '' &&
+    !['mock', 'sandbox', 'production', 'disabled'].includes(
+      momoMode.trim().toLowerCase(),
+    )
+  ) {
+    throw new Error(
+      'MOMO_MODE must be one of: mock, sandbox, production, disabled.',
+    );
+  }
+  if (
+    typeof momoMode === 'string' &&
+    momoMode.trim().toLowerCase() === 'mock' &&
+    nodeEnv === 'production'
+  ) {
+    throw new Error('MOMO_MODE=mock is not allowed when NODE_ENV=production.');
+  }
+
   const smtpEnabled = isSmtpConfigured(config);
 
   const smtpBlock = smtpEnabled

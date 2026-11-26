@@ -2,117 +2,160 @@ import { Injectable } from '@nestjs/common';
 import {
   ContributionStatus,
   DepositPaymentMethod,
+  DepositPurpose,
   DepositRecordStatus,
+  FineStatus,
   GroupMembershipStatus,
   LoanApplicationStatus,
-  MemberLoanStatus,
+  LoanDisbursementStatus,
   Prisma,
 } from '@prisma/client';
+import { EPS, decN, roundMoney } from '../finance-core/money.util';
+import {
+  OPEN_LOAN_STATUSES,
+  PAYABLE_LOAN_STATUSES,
+  loanBalances,
+} from '../finance-core/payment-allocation.service';
 import { PrismaService } from '../prisma/prisma.service';
 
-function dec(v: Prisma.Decimal | null | undefined): number {
-  return v == null ? 0 : v.toNumber();
+const METHOD_LABEL: Record<DepositPaymentMethod, string> = {
+  MTN_MOMO: 'MTN MoMo',
+  MANUAL_TRANSFER: 'Manual transfer',
+};
+
+function depositDescription(d: {
+  purpose: DepositPurpose;
+  paymentMethod: DepositPaymentMethod;
+  contributionPortion: Prisma.Decimal;
+  finePortion: Prisma.Decimal;
+  installmentPortion: Prisma.Decimal;
+}) {
+  const parts: string[] = [];
+  if (decN(d.contributionPortion) > EPS) parts.push('contribution');
+  if (decN(d.finePortion) > EPS)
+    parts.push(
+      d.purpose === DepositPurpose.LOAN_REPAYMENT ? 'loan penalty' : 'fines',
+    );
+  if (decN(d.installmentPortion) > EPS) parts.push('loan repayment');
+  const what =
+    parts.length === 0
+      ? d.purpose === DepositPurpose.LOAN_REPAYMENT
+        ? 'Loan repayment'
+        : 'Contribution'
+      : parts[0][0].toUpperCase() + parts.join(' + ').slice(1);
+  return `${what} (${METHOD_LABEL[d.paymentMethod]})`;
 }
 
 @Injectable()
 export class UserFinanceService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async getSummary(userId: string) {
-    const memberships = await this.prisma.userGroup.findMany({
+  private async liveMemberships(userId: string) {
+    return this.prisma.userGroup.findMany({
       where: {
         userId,
         membershipStatus: GroupMembershipStatus.ACTIVE,
+        group: { deletedAt: null },
       },
       include: {
-        group: {
-          select: { id: true, name: true, isVerified: true },
-        },
+        group: { select: { id: true, name: true, isVerified: true } },
       },
       orderBy: { joinedAt: 'asc' },
     });
+  }
 
-    const verifiedGroupIds = memberships
-      .filter((m) => m.group.isVerified)
-      .map((m) => m.group.id);
+  async getSummary(userId: string) {
+    const memberships = (await this.liveMemberships(userId)).filter(
+      (m) => m.group.isVerified,
+    );
+    const groupIds = memberships.map((m) => m.group.id);
 
     const groupBalances = await Promise.all(
-      memberships
-        .filter((m) => m.group.isVerified)
-        .map(async (m) => {
-          const cc = await this.prisma.contributionConfig.findUnique({
+      memberships.map(async (m) => {
+        const [cc, paid, late, fines, loans] = await Promise.all([
+          this.prisma.contributionConfig.findUnique({
             where: { groupId: m.group.id },
-          });
-          const currency = cc?.currency ?? 'RWF';
-          const paid = await this.prisma.contribution.aggregate({
+          }),
+          this.prisma.contribution.aggregate({
+            where: { userId, groupId: m.group.id },
+            _sum: { amountPaid: true },
+          }),
+          this.prisma.contribution.findMany({
             where: {
               userId,
               groupId: m.group.id,
-              status: ContributionStatus.PAID,
-            },
-            _sum: { amount: true },
-          });
-          return {
-            groupId: m.group.id,
-            groupName: m.group.name,
-            totalContributed: dec(paid._sum.amount),
-            currency,
-            memberSince: m.joinedAt.toISOString(),
-          };
-        }),
-    );
-
-    const lateRows =
-      verifiedGroupIds.length === 0
-        ? []
-        : await this.prisma.contribution.findMany({
-            where: {
-              userId,
-              groupId: { in: verifiedGroupIds },
               status: ContributionStatus.LATE,
             },
-            include: {
-              group: {
-                select: {
-                  id: true,
-                  name: true,
-                  contributionConfig: {
-                    select: { currency: true, latePenaltyRate: true },
-                  },
-                },
-              },
+            select: { amount: true, amountPaid: true },
+          }),
+          this.prisma.fine.findMany({
+            where: { userId, groupId: m.group.id, status: FineStatus.OPEN },
+            select: { amount: true, amountPaid: true },
+          }),
+          this.prisma.memberLoan.findMany({
+            where: {
+              userId,
+              groupId: m.group.id,
+              status: { in: PAYABLE_LOAN_STATUSES },
             },
+          }),
+        ]);
+        return {
+          groupId: m.group.id,
+          groupName: m.group.name,
+          totalContributed: roundMoney(decN(paid._sum.amountPaid)),
+          arrears: roundMoney(
+            late.reduce((s, r) => s + decN(r.amount) - decN(r.amountPaid), 0),
+          ),
+          lateContributions: late.length,
+          openFines: roundMoney(
+            fines.reduce((s, f) => s + decN(f.amount) - decN(f.amountPaid), 0),
+          ),
+          loanOutstanding: roundMoney(
+            loans.reduce((s, l) => s + loanBalances(l).outstanding, 0),
+          ),
+          currency: cc?.currency ?? 'RWF',
+          memberSince: m.joinedAt.toISOString(),
+        };
+      }),
+    );
+
+    const openFines =
+      groupIds.length === 0
+        ? []
+        : await this.prisma.fine.findMany({
+            where: {
+              userId,
+              groupId: { in: groupIds },
+              status: FineStatus.OPEN,
+            },
+            include: {
+              group: { select: { name: true } },
+              contribution: { select: { dueDate: true } },
+            },
+            orderBy: { createdAt: 'asc' },
           });
 
-    const penaltyBalances: {
-      id: string;
-      groupId: string;
-      groupName: string;
-      amount: number;
-      currency: string;
-      reason: string;
-      dueDate: string;
-    }[] = [];
-
-    for (const row of lateRows) {
-      const rate = row.group.contributionConfig?.latePenaltyRate;
-      const base = dec(row.amount);
-      const fine = rate != null ? roundMoney(base * (dec(rate) / 100)) : 0;
-      if (fine <= 0) continue;
-      penaltyBalances.push({
-        id: row.id,
-        groupId: row.groupId,
-        groupName: row.group.name,
-        amount: fine,
-        currency: row.group.contributionConfig?.currency ?? 'RWF',
-        reason: `Late fee on contribution due ${row.dueDate.toISOString().slice(0, 10)}`,
-        dueDate: row.dueDate.toISOString(),
-      });
-    }
+    const penaltyBalances = openFines
+      .map((f) => ({
+        id: f.id,
+        groupId: f.groupId,
+        groupName: f.group.name,
+        amount: roundMoney(decN(f.amount) - decN(f.amountPaid)),
+        currency: f.currency,
+        type: f.type,
+        reason: f.reason,
+        dueDate: (f.contribution?.dueDate ?? f.createdAt).toISOString(),
+      }))
+      .filter((p) => p.amount > EPS);
 
     return { groupBalances, penaltyBalances };
   }
 
+  /**
+   * One line per real money movement: confirmed payments (debits from the member's point of
+   * view) and completed loan payouts (credits). Paid contribution rows are not listed again.
+   */
   async getHistory(userId: string, page: number, pageSize: number) {
     const p = Math.max(1, page);
     const ps = Math.min(100, Math.max(1, pageSize));
@@ -120,120 +163,187 @@ export class UserFinanceService {
 
     const [countRow] = await this.prisma.$queryRaw<[{ c: bigint }]>(
       Prisma.sql`
-        SELECT COUNT(*)::bigint AS c
-        FROM (
-          SELECT c.id
-          FROM contributions c
-          WHERE c."userId" = ${userId}
-            AND c.status = 'PAID'::"ContributionStatus"
-            AND c."paidAt" IS NOT NULL
+        SELECT COUNT(*)::bigint AS c FROM (
+          SELECT d.id FROM deposit_records d
+          JOIN groups g ON g.id = d."groupId" AND g."deletedAt" IS NULL
+          WHERE d."userId" = ${userId} AND d.status = 'CONFIRMED'::"DepositRecordStatus"
           UNION ALL
-          SELECT d.id
-          FROM deposit_records d
-          WHERE d."userId" = ${userId}
-            AND d.status = 'CONFIRMED'::"DepositRecordStatus"
-        ) AS t
+          SELECT ld.id FROM loan_disbursements ld
+          JOIN member_loans ml ON ml.id = ld."memberLoanId"
+          JOIN groups g2 ON g2.id = ld."groupId" AND g2."deletedAt" IS NULL
+          WHERE ml."userId" = ${userId} AND ld.status = 'COMPLETED'::"LoanDisbursementStatus"
+        ) t
       `,
     );
-
     const totalItems = Number(countRow?.c ?? 0n);
     const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / ps);
 
-    const raw = await this.prisma.$queryRaw<
-      {
-        id: string;
-        txType: string;
-        eventAt: Date;
-        amount: number;
-        groupId: string;
-        groupName: string;
-        currency: string;
-        description: string;
-        isCredit: boolean;
-      }[]
+    const page_ = await this.prisma.$queryRaw<
+      { id: string; kind: string; eventAt: Date }[]
     >(
       Prisma.sql`
         SELECT * FROM (
-          SELECT c.id,
-                 'CONTRIBUTION'::text AS "txType",
-                 c."paidAt" AS "eventAt",
-                 (c.amount)::float AS amount,
-                 c."groupId",
-                 g.name AS "groupName",
-                 COALESCE(cc.currency, 'RWF')::text AS currency,
-                 'Contribution (paid)'::text AS description,
-                 false AS "isCredit"
-          FROM contributions c
-          INNER JOIN groups g ON g.id = c."groupId"
-          LEFT JOIN contribution_config cc ON cc."groupId" = c."groupId"
-          WHERE c."userId" = ${userId}
-            AND c.status = 'PAID'::"ContributionStatus"
-            AND c."paidAt" IS NOT NULL
-          UNION ALL
-          SELECT d.id,
-                 'DEPOSIT'::text AS "txType",
-                 COALESCE(d."reviewedAt", d."createdAt") AS "eventAt",
-                 (d.amount)::float AS amount,
-                 d."groupId",
-                 g2.name AS "groupName",
-                 d.currency::text,
-                 'Manual bank deposit (confirmed)'::text AS description,
-                 false
+          SELECT d.id, 'DEPOSIT'::text AS kind, COALESCE(d."reviewedAt", d."createdAt") AS "eventAt"
           FROM deposit_records d
-          INNER JOIN groups g2 ON g2.id = d."groupId"
-          WHERE d."userId" = ${userId}
-            AND d.status = 'CONFIRMED'::"DepositRecordStatus"
-        ) AS u
+          JOIN groups g ON g.id = d."groupId" AND g."deletedAt" IS NULL
+          WHERE d."userId" = ${userId} AND d.status = 'CONFIRMED'::"DepositRecordStatus"
+          UNION ALL
+          SELECT ld.id, 'LOAN_DISBURSEMENT'::text, COALESCE(ld."completedAt", ld."createdAt")
+          FROM loan_disbursements ld
+          JOIN member_loans ml ON ml.id = ld."memberLoanId"
+          JOIN groups g2 ON g2.id = ld."groupId" AND g2."deletedAt" IS NULL
+          WHERE ml."userId" = ${userId} AND ld.status = 'COMPLETED'::"LoanDisbursementStatus"
+        ) u
         ORDER BY u."eventAt" DESC
         LIMIT ${ps} OFFSET ${skip}
       `,
     );
 
-    const items = raw.map((r) => ({
-      id: r.id,
-      groupId: r.groupId,
-      groupName: r.groupName,
-      type: r.txType,
-      amount: roundMoney(Number(r.amount)),
-      currency: r.currency,
-      date: new Date(r.eventAt).toISOString(),
-      description: r.description,
-      isCredit: r.isCredit,
-      status: 'COMPLETED' as const,
-    }));
+    const depIds = page_.filter((r) => r.kind === 'DEPOSIT').map((r) => r.id);
+    const disIds = page_
+      .filter((r) => r.kind === 'LOAN_DISBURSEMENT')
+      .map((r) => r.id);
+    const [deps, dis] = await Promise.all([
+      this.prisma.depositRecord.findMany({
+        where: { id: { in: depIds } },
+        include: { group: { select: { name: true } } },
+      }),
+      this.prisma.loanDisbursement.findMany({
+        where: { id: { in: disIds } },
+        include: { group: { select: { name: true } } },
+      }),
+    ]);
+    const depById = new Map(deps.map((d) => [d.id, d]));
+    const disById = new Map(dis.map((d) => [d.id, d]));
 
-    return {
-      items,
-      totalItems,
-      page: p,
-      pageSize: ps,
-      totalPages,
+    type HistoryItem = {
+      id: string;
+      groupId: string;
+      groupName: string;
+      type: string;
+      amount: number;
+      currency: string;
+      date: string;
+      description: string;
+      isCredit: boolean;
+      status: 'COMPLETED';
+      paymentMethod: DepositPaymentMethod | null;
+      breakdown: { contribution: number; fine: number; loan: number } | null;
     };
+    const items = page_.flatMap((r): HistoryItem[] => {
+      if (r.kind === 'DEPOSIT') {
+        const d = depById.get(r.id);
+        if (!d) return [];
+        const loanOnly =
+          decN(d.installmentPortion) > EPS && decN(d.contributionPortion) < EPS;
+        return [
+          {
+            id: d.id,
+            groupId: d.groupId,
+            groupName: d.group.name,
+            type: loanOnly ? 'LOAN_REPAYMENT' : 'DEPOSIT',
+            amount: roundMoney(decN(d.amount)),
+            currency: d.currency,
+            date: new Date(r.eventAt).toISOString(),
+            description: depositDescription(d),
+            isCredit: false,
+            status: 'COMPLETED' as const,
+            paymentMethod: d.paymentMethod,
+            breakdown: {
+              contribution: decN(d.contributionPortion),
+              fine: decN(d.finePortion),
+              loan: decN(d.installmentPortion),
+            },
+          },
+        ];
+      }
+      const d = disById.get(r.id);
+      if (!d) return [];
+      return [
+        {
+          id: d.id,
+          groupId: d.groupId,
+          groupName: d.group.name,
+          type: 'LOAN_DISBURSEMENT',
+          amount: roundMoney(decN(d.amount)),
+          currency: d.currency,
+          date: new Date(r.eventAt).toISOString(),
+          description:
+            d.method === 'MTN_MOMO'
+              ? 'Loan received (MTN MoMo)'
+              : d.method === 'CASH'
+                ? 'Loan received (cash)'
+                : d.method === 'BANK_TRANSFER'
+                  ? 'Loan received (bank transfer)'
+                  : 'Loan disbursed',
+          isCredit: true,
+          status: 'COMPLETED' as const,
+          paymentMethod: null,
+          breakdown: null,
+        },
+      ];
+    });
+
+    return { items, totalItems, page: p, pageSize: ps, totalPages };
   }
 
   async getUpcoming(userId: string) {
-    const memberships = await this.prisma.userGroup.findMany({
-      where: {
-        userId,
-        membershipStatus: GroupMembershipStatus.ACTIVE,
-      },
-      include: { group: { select: { id: true, name: true, isVerified: true } } },
-    });
+    const memberships = (await this.liveMemberships(userId)).filter(
+      (m) => m.group.isVerified,
+    );
+    const groupIds = memberships.map((m) => m.groupId);
+    const nameByGid = new Map(
+      memberships.map((m) => [m.groupId, m.group.name]),
+    );
+    if (groupIds.length === 0) return { items: [] };
 
-    const groupIds = memberships.filter((m) => m.group.isVerified).map((m) => m.groupId);
-    const nameByGid = new Map(memberships.map((m) => [m.groupId, m.group.name]));
-
-    const openContributions =
-      groupIds.length === 0
-        ? []
-        : await this.prisma.contribution.findMany({
-            where: {
-              userId,
-              groupId: { in: groupIds },
-              status: { in: [ContributionStatus.PENDING, ContributionStatus.LATE] },
-            },
-            orderBy: { dueDate: 'asc' },
-          });
+    const [rows, fines, configs, pendingDeposits, loans] = await Promise.all([
+      this.prisma.contribution.findMany({
+        where: {
+          userId,
+          groupId: { in: groupIds },
+          status: {
+            in: [
+              ContributionStatus.PENDING,
+              ContributionStatus.PARTIALLY_PAID,
+              ContributionStatus.LATE,
+            ],
+          },
+        },
+        orderBy: { dueDate: 'asc' },
+      }),
+      this.prisma.fine.findMany({
+        where: { userId, groupId: { in: groupIds }, status: FineStatus.OPEN },
+        include: { contribution: { select: { dueDate: true } } },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.prisma.contributionConfig.findMany({
+        where: { groupId: { in: groupIds } },
+      }),
+      this.prisma.depositRecord.findMany({
+        where: {
+          userId,
+          groupId: { in: groupIds },
+          status: {
+            in: [
+              DepositRecordStatus.PENDING_VERIFICATION,
+              DepositRecordStatus.PENDING,
+            ],
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.memberLoan.findMany({
+        where: {
+          userId,
+          groupId: { in: groupIds },
+          status: { in: OPEN_LOAN_STATUSES },
+        },
+        include: { disbursement: { select: { status: true } } },
+      }),
+    ]);
+    const currencyByGid = new Map(configs.map((c) => [c.groupId, c.currency]));
+    const now = new Date();
 
     const items: {
       id: string;
@@ -247,68 +357,84 @@ export class UserFinanceService {
       status: string;
     }[] = [];
 
-    for (const c of openContributions) {
-      const cc = await this.prisma.contributionConfig.findUnique({
-        where: { groupId: c.groupId },
-      });
-      const currency = cc?.currency ?? 'RWF';
-      const now = new Date();
-      now.setHours(0, 0, 0, 0);
-      const due = new Date(c.dueDate);
-      due.setHours(0, 0, 0, 0);
-      const isPast = due.getTime() < now.getTime();
-
-      let amount = dec(c.amount);
-      let type = 'CONTRIBUTION';
-      let status: string;
-      if (c.status === ContributionStatus.LATE) {
-        type = 'PENALTY';
-        const rate = cc?.latePenaltyRate;
-        amount = rate != null ? roundMoney(amount * (dec(rate) / 100)) : amount;
-        status = 'OVERDUE';
-      } else {
-        status = isPast ? 'OVERDUE' : 'PENDING';
-      }
-
+    for (const c of rows) {
+      const remaining = roundMoney(decN(c.amount) - decN(c.amountPaid));
+      if (remaining < EPS) continue;
+      const day = c.dueDate.toISOString().slice(0, 10);
       items.push({
         id: c.id,
         groupId: c.groupId,
         groupName: nameByGid.get(c.groupId) ?? 'Group',
-        type: type as 'CONTRIBUTION' | 'PENALTY',
-        amount,
-        currency,
+        type: 'CONTRIBUTION',
+        amount: remaining,
+        currency: currencyByGid.get(c.groupId) ?? 'RWF',
         dueDate: c.dueDate.toISOString(),
         description:
-          c.status === ContributionStatus.LATE
-            ? `Late penalty (contribution due ${c.dueDate.toISOString().slice(0, 10)})`
-            : `Contribution due ${c.dueDate.toISOString().slice(0, 10)}`,
-        status,
+          decN(c.amountPaid) > EPS
+            ? `Contribution due ${day} (rest of ${decN(c.amount).toFixed(0)})`
+            : `Contribution due ${day}`,
+        status:
+          c.status === ContributionStatus.LATE || c.dueDate < now
+            ? 'OVERDUE'
+            : 'PENDING',
       });
     }
 
-    if (groupIds.length > 0) {
-      const manualPending = await this.prisma.depositRecord.findMany({
-        where: {
-          userId,
-          groupId: { in: groupIds },
-          status: DepositRecordStatus.PENDING_VERIFICATION,
-          paymentMethod: DepositPaymentMethod.MANUAL_TRANSFER,
-        },
-        orderBy: { createdAt: 'desc' },
+    for (const f of fines) {
+      const remaining = roundMoney(decN(f.amount) - decN(f.amountPaid));
+      if (remaining < EPS) continue;
+      items.push({
+        id: f.id,
+        groupId: f.groupId,
+        groupName: nameByGid.get(f.groupId) ?? 'Group',
+        type: 'PENALTY',
+        amount: remaining,
+        currency: f.currency,
+        dueDate: (f.contribution?.dueDate ?? f.createdAt).toISOString(),
+        description: f.reason,
+        status: 'OVERDUE',
       });
-      for (const d of manualPending) {
-        items.push({
-          id: d.id,
-          groupId: d.groupId,
-          groupName: nameByGid.get(d.groupId) ?? 'Group',
-          type: 'DEPOSIT',
-          amount: dec(d.amount),
-          currency: d.currency,
-          dueDate: d.createdAt.toISOString(),
-          description: 'Manual bank transfer — awaiting group admin confirmation',
-          status: 'PENDING_CONFIRMATION',
-        });
-      }
+    }
+
+    for (const l of loans) {
+      if (
+        l.disbursement &&
+        l.disbursement.status !== LoanDisbursementStatus.COMPLETED
+      )
+        continue;
+      const { outstanding } = loanBalances(l);
+      if (outstanding < EPS) continue;
+      items.push({
+        id: l.id,
+        groupId: l.groupId,
+        groupName: nameByGid.get(l.groupId) ?? 'Group',
+        type: 'LOAN',
+        amount: outstanding,
+        currency: l.currency,
+        dueDate: l.dueDate.toISOString(),
+        description:
+          l.status === 'DEFAULTED'
+            ? 'Loan in default — repay as soon as possible'
+            : `Loan balance due ${l.dueDate.toISOString().slice(0, 10)}`,
+        status: l.dueDate < now ? 'OVERDUE' : 'PENDING',
+      });
+    }
+
+    for (const d of pendingDeposits) {
+      items.push({
+        id: d.id,
+        groupId: d.groupId,
+        groupName: nameByGid.get(d.groupId) ?? 'Group',
+        type: 'DEPOSIT',
+        amount: decN(d.amount),
+        currency: d.currency,
+        dueDate: d.createdAt.toISOString(),
+        description:
+          d.status === DepositRecordStatus.PENDING
+            ? 'MTN MoMo payment — waiting for approval on your phone'
+            : 'Manual bank transfer — awaiting leader confirmation',
+        status: 'PENDING_CONFIRMATION',
+      });
     }
 
     return { items };
@@ -316,9 +442,10 @@ export class UserFinanceService {
 
   /** Member-facing: all loan applications and disbursed member loans for the current user. */
   async getUserLoans(userId: string) {
+    const live = { group: { deletedAt: null } };
     const [applications, memberLoans] = await Promise.all([
       this.prisma.loanApplication.findMany({
-        where: { userId },
+        where: { userId, ...live },
         orderBy: { createdAt: 'desc' },
         include: {
           group: { select: { id: true, name: true } },
@@ -326,11 +453,15 @@ export class UserFinanceService {
         },
       }),
       this.prisma.memberLoan.findMany({
-        where: { userId },
+        where: { userId, ...live },
         orderBy: { createdAt: 'desc' },
-        include: { group: { select: { id: true, name: true } } },
+        include: {
+          group: { select: { id: true, name: true } },
+          disbursement: true,
+        },
       }),
     ]);
+    const now = new Date();
 
     return {
       applications: applications.map((a) => {
@@ -340,9 +471,9 @@ export class UserFinanceService {
           id: a.id,
           groupId: a.groupId,
           groupName: a.group.name,
-          requestedAmount: dec(a.requestedAmount),
+          requestedAmount: decN(a.requestedAmount),
           currency: 'RWF',
-          interestRate: dec(a.interestRateSnapshot),
+          interestRate: decN(a.interestRateSnapshot),
           repaymentPeriodDays: a.repaymentPeriodDaysSnapshot,
           status: a.status,
           createdAt: a.createdAt.toISOString(),
@@ -364,36 +495,34 @@ export class UserFinanceService {
         };
       }),
       memberLoans: memberLoans.map((l) => {
-        const tr = dec(l.totalRepayable);
-        const rep = dec(l.amountRepaid);
-        const pen = dec(l.penaltyAccrued);
-        const outstanding = Math.round((tr - rep + pen) * 100) / 100;
-        const now = new Date();
-        const isOverdue =
-          l.status === MemberLoanStatus.ACTIVE && l.dueDate < now && outstanding > 0.01;
+        const { penalty, outstanding } = loanBalances(l);
         return {
           id: l.id,
           groupId: l.groupId,
           groupName: l.group.name,
           applicationId: l.applicationId,
-          principal: dec(l.principalAmount),
-          totalRepayable: tr,
-          amountRepaid: rep,
-          penaltyAccrued: pen,
-          outstanding: Math.max(0, outstanding),
+          principal: decN(l.principalAmount),
+          totalRepayable: decN(l.totalRepayable),
+          amountRepaid: decN(l.amountRepaid),
+          penaltyAccrued: penalty,
+          outstanding,
           currency: l.currency,
-          interestRate: dec(l.interestRateSnapshot),
+          interestRate: decN(l.interestRateSnapshot),
           repaymentPeriodDays: l.repaymentPeriodDaysSnapshot,
           disbursedAt: l.disbursedAt.toISOString(),
           dueDate: l.dueDate.toISOString(),
+          originalDueDate: l.originalDueDate?.toISOString() ?? null,
           status: l.status,
-          isOverdue,
+          isOverdue:
+            OPEN_LOAN_STATUSES.includes(l.status) &&
+            l.dueDate < now &&
+            outstanding > EPS,
+          canRepay:
+            PAYABLE_LOAN_STATUSES.includes(l.status) && outstanding > EPS,
+          disbursementStatus: l.disbursement?.status ?? null,
+          disbursementMethod: l.disbursement?.method ?? null,
         };
       }),
     };
   }
-}
-
-function roundMoney(n: number): number {
-  return Math.round(n * 100) / 100;
 }

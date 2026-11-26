@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  ParseBoolPipe,
+  Post,
+  Query,
+} from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiCreatedResponse,
@@ -24,6 +33,15 @@ import { RejectManualDepositDto } from './dto/reject-manual-deposit.dto';
 import { GroupFinanceService } from './group-finance.service';
 import { GroupLoansService } from './group-loans.service';
 import { RejectLoanApplicationDto } from './dto/reject-loan-application.dto';
+import {
+  ExtendLoanDto,
+  IssueFineDto,
+  ListFinesQueryDto,
+  ManualDisbursementDto,
+  ReasonDto,
+} from './dto/finance-actions.dto';
+import { FinesService } from './fines.service';
+import { FinanceJobsService } from './finance-jobs.service';
 
 @ApiTags('group-finance')
 @ApiBearerAuth('JWT-auth')
@@ -32,6 +50,8 @@ export class GroupFinanceController {
   constructor(
     private readonly groupFinance: GroupFinanceService,
     private readonly groupLoans: GroupLoansService,
+    private readonly fines: FinesService,
+    private readonly jobs: FinanceJobsService,
   ) {}
 
   @Get('deposit-preview')
@@ -48,8 +68,12 @@ export class GroupFinanceController {
   depositPreview(
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
+    @Query('includeLoan', new ParseBoolPipe({ optional: true }))
+    includeLoan?: boolean,
   ) {
-    return this.groupFinance.getDepositPreview(user.id, groupId);
+    return this.groupFinance.getDepositPreview(user.id, groupId, {
+      includeLoan,
+    });
   }
 
   @Post('deposits')
@@ -66,6 +90,7 @@ export class GroupFinanceController {
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
     @Body() dto: CreateDepositDto,
+    @Headers('idempotency-key') idempotencyHeader?: string,
   ) {
     return this.groupFinance.createDeposit(user.id, groupId, {
       amount: dto.amount,
@@ -73,6 +98,8 @@ export class GroupFinanceController {
       phone: dto.phone,
       proofImageUrl: dto.proofImageUrl,
       memberLoanId: dto.memberLoanId,
+      includeLoanRepayment: dto.includeLoanRepayment,
+      idempotencyKey: dto.idempotencyKey ?? idempotencyHeader,
     });
   }
 
@@ -279,5 +306,163 @@ export class GroupFinanceController {
       applicationId,
       dto.reason,
     );
+  }
+
+  // ── deposit status ──────────────────────────────────────────────────────
+
+  @Get('deposits/:depositId')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({
+    summary:
+      'Deposit status and allocation (own deposit, or any for leaders). Refreshes a pending MoMo payment from MTN.',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'depositId', type: String })
+  getDeposit(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('depositId') depositId: string,
+  ) {
+    return this.groupFinance.getDepositStatus(user.id, groupId, depositId);
+  }
+
+  @Get('cash-position')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({
+    summary: 'Group cash in (confirmed deposits), loans out and available cash',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  cashPosition(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+  ) {
+    return this.groupFinance.getCashPosition(user.id, groupId);
+  }
+
+  // ── fines ───────────────────────────────────────────────────────────────
+
+  @Get('fines')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({ summary: 'Fines (leaders: all members; members: their own)' })
+  @ApiParam({ name: 'groupId', type: String })
+  listFines(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Query() q: ListFinesQueryDto,
+  ) {
+    return this.fines.list(user.id, groupId, q);
+  }
+
+  @Post('fines')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({ summary: 'Issue a fine to a member (not to yourself)' })
+  @ApiParam({ name: 'groupId', type: String })
+  issueFine(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Body() dto: IssueFineDto,
+  ) {
+    return this.fines.issue(user.id, groupId, dto);
+  }
+
+  @Post('fines/:fineId/waive')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({ summary: 'Waive an open fine (not your own)' })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'fineId', type: String })
+  waiveFine(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('fineId') fineId: string,
+    @Body() dto: ReasonDto,
+  ) {
+    return this.fines.waive(user.id, groupId, fineId, dto.reason);
+  }
+
+  // ── loan actions ────────────────────────────────────────────────────────
+
+  @Post('member-loans/:memberLoanId/write-off')
+  @GroupRole(RoleName.GROUP_ADMIN)
+  @ApiOperation({
+    summary: 'Write off an active/defaulted loan (group admin; not your own)',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  writeOff(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+    @Body() dto: ReasonDto,
+  ) {
+    return this.groupLoans.writeOffLoan(
+      user.id,
+      groupId,
+      memberLoanId,
+      dto.reason,
+    );
+  }
+
+  @Post('member-loans/:memberLoanId/extend')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({
+    summary:
+      'Extend the due date (restructure); a defaulted loan becomes active again',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  extend(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+    @Body() dto: ExtendLoanDto,
+  ) {
+    return this.groupLoans.extendLoan(user.id, groupId, memberLoanId, dto);
+  }
+
+  @Post('member-loans/:memberLoanId/disbursement/retry')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({ summary: 'Retry a failed MTN MoMo loan payout' })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  retryDisbursement(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+  ) {
+    return this.groupLoans.retryDisbursement(user.id, groupId, memberLoanId);
+  }
+
+  @Post('member-loans/:memberLoanId/disbursement/manual')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({
+    summary: 'Record a cash / bank payout (loan term restarts from now)',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  manualDisbursement(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+    @Body() dto: ManualDisbursementDto,
+  ) {
+    return this.groupLoans.recordManualDisbursement(
+      user.id,
+      groupId,
+      memberLoanId,
+      dto,
+    );
+  }
+
+  // ── scheduler (manual trigger) ──────────────────────────────────────────
+
+  @Post('jobs/run')
+  @GroupRole(RoleName.GROUP_ADMIN)
+  @ApiOperation({
+    summary:
+      'Run the daily money jobs now for this group (generate periods, mark late, fines, reminders, loan penalties). Idempotent.',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  runJobs(@Param('groupId') groupId: string) {
+    return this.jobs.runDaily(groupId);
   }
 }

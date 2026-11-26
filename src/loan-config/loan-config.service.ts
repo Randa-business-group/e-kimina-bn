@@ -85,6 +85,15 @@ export class LoanConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         penaltyRate: penalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.penaltyPeriodDays !== undefined
+          ? { penaltyPeriodDays: dto.penaltyPeriodDays }
+          : {}),
+        ...(dto.defaultAfterDays !== undefined
+          ? { defaultAfterDays: dto.defaultAfterDays }
+          : {}),
+        ...(dto.blockIfArrears !== undefined
+          ? { blockIfArrears: dto.blockIfArrears }
+          : {}),
       },
       update: {
         interestRate: new Prisma.Decimal(dto.interestRate),
@@ -94,6 +103,15 @@ export class LoanConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         penaltyRate: penalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.penaltyPeriodDays !== undefined
+          ? { penaltyPeriodDays: dto.penaltyPeriodDays }
+          : {}),
+        ...(dto.defaultAfterDays !== undefined
+          ? { defaultAfterDays: dto.defaultAfterDays }
+          : {}),
+        ...(dto.blockIfArrears !== undefined
+          ? { blockIfArrears: dto.blockIfArrears }
+          : {}),
       },
     });
 
@@ -110,6 +128,9 @@ export class LoanConfigService {
     allowPartialPayments: boolean;
     penaltyRate: Prisma.Decimal | null;
     gracePeriodDays: number;
+    penaltyPeriodDays: number;
+    defaultAfterDays: number | null;
+    blockIfArrears: boolean;
     createdAt: Date;
     updatedAt: Date;
   }) {
@@ -127,6 +148,9 @@ export class LoanConfigService {
       penaltyRate:
         config.penaltyRate == null ? null : decimalToNumber(config.penaltyRate),
       gracePeriodDays: config.gracePeriodDays,
+      penaltyPeriodDays: config.penaltyPeriodDays,
+      defaultAfterDays: config.defaultAfterDays,
+      blockIfArrears: config.blockIfArrears,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
     };

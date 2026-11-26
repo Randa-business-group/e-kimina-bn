@@ -27,13 +27,11 @@ export class GroupRoleGuard implements CanActivate {
       return true;
     }
 
-    const request = context
-      .switchToHttp()
-      .getRequest<{
-        user?: AuthenticatedUser;
-        params?: { groupId?: string };
-        method?: string;
-      }>();
+    const request = context.switchToHttp().getRequest<{
+      user?: AuthenticatedUser;
+      params?: { groupId?: string };
+      method?: string;
+    }>();
 
     const user = request.user;
 
@@ -59,6 +57,8 @@ export class GroupRoleGuard implements CanActivate {
         userId: user.id,
         groupId,
         membershipStatus: GroupMembershipStatus.ACTIVE,
+        // Soft-deleted groups are closed to members (super admins keep read access below).
+        group: { deletedAt: null },
       },
       include: {
         role: true,

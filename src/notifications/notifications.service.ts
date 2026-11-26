@@ -506,6 +506,132 @@ export class NotificationsService {
     );
   }
 
+  /** Generic: one notification to one member (audience MEMBER). */
+  async notifyMember(p: {
+    userId: string;
+    groupId: string | null;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    await this.createOne(p.userId, {
+      groupId: p.groupId,
+      type: p.type,
+      audience: NotificationAudience.MEMBER,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    });
+  }
+
+  /** Generic: all active group admins and treasurers (optionally excluding one user). */
+  async notifyFinanceLeaders(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+    excludeUserId?: string;
+  }) {
+    const admins = (
+      await this.userIdsByRoles(p.groupId, [RoleName.GROUP_ADMIN])
+    ).filter((id) => id !== p.excludeUserId);
+    const treasurers = (
+      await this.userIdsByRoles(p.groupId, [RoleName.TREASURER])
+    ).filter((id) => id !== p.excludeUserId && !admins.includes(id));
+    const base = {
+      groupId: p.groupId,
+      type: p.type,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    };
+    await this.createMany(admins, {
+      ...base,
+      audience: NotificationAudience.GROUP_ADMIN,
+    });
+    await this.createMany(treasurers, {
+      ...base,
+      audience: NotificationAudience.TREASURER,
+    });
+  }
+
+  /** Generic: only the group admins of a group. */
+  async notifyGroupAdmins(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    const admins = await this.userIdsByRoles(p.groupId, [RoleName.GROUP_ADMIN]);
+    await this.createMany(admins, {
+      groupId: p.groupId,
+      type: p.type,
+      audience: NotificationAudience.GROUP_ADMIN,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    });
+  }
+
+  /** Generic: every active platform super admin. */
+  async notifySuperAdmins(p: {
+    groupId: string | null;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    const rows = await this.prisma.userPlatformRole.findMany({
+      where: { role: { name: RoleName.SUPER_ADMIN }, user: { isActive: true } },
+      select: { userId: true },
+    });
+    await this.createMany(
+      rows.map((r) => r.userId),
+      {
+        groupId: p.groupId,
+        type: p.type,
+        audience: NotificationAudience.SUPER_ADMIN,
+        title: p.title,
+        body: p.body,
+        metadata: p.metadata,
+      },
+    );
+  }
+
+  /** Bulk insert of pre-built member notifications (scheduler). */
+  async createMemberNotificationsBulk(
+    rows: {
+      userId: string;
+      groupId: string;
+      type: NotificationType;
+      title: string;
+      body: string;
+      metadata?: object | null;
+    }[],
+  ) {
+    if (rows.length === 0) return;
+    try {
+      await this.prisma.userNotification.createMany({
+        data: rows.map((r) => ({
+          userId: r.userId,
+          groupId: r.groupId,
+          type: r.type,
+          audience: NotificationAudience.MEMBER,
+          title: r.title,
+          body: r.body,
+          ...(r.metadata != null && { metadata: r.metadata }),
+        })),
+      });
+    } catch (e) {
+      this.logger.error(
+        `bulk notifications failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   async listForUser(
     userId: string,
     q: {

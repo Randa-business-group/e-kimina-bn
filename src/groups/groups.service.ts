@@ -9,11 +9,18 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  DepositRecordStatus,
   GroupMembershipStatus,
   GroupRemovalKind,
+  GroupVerificationStatus,
+  LoanApplicationStatus,
+  LoanDisbursementStatus,
+  MemberLoanStatus,
+  NotificationType,
   Prisma,
   RoleName,
 } from '@prisma/client';
+import { ContributionScheduleService } from '../finance-core/contribution-schedule.service';
 import { hash } from 'bcryptjs';
 import { EmailService } from '../email/email.service.js';
 import { appConfig } from '../config/app.config';
@@ -31,6 +38,10 @@ const groupSelect = {
   isPublic: true,
   createdById: true,
   isVerified: true,
+  verificationStatus: true,
+  verificationRequestedAt: true,
+  verificationRejectionReason: true,
+  deletedAt: true,
   minMembers: true,
   createdAt: true,
 } satisfies Prisma.GroupSelect;
@@ -59,7 +70,15 @@ export class GroupsService {
     private readonly emailService: EmailService,
     private readonly configService: ConfigService<AppConfig, true>,
     private readonly notifications: NotificationsService,
+    private readonly schedule: ContributionScheduleService,
   ) {}
+
+  /** Generate the member's contribution periods right away (scheduler also does it daily). */
+  private ensureMemberSchedule(groupId: string, userId: string) {
+    void this.schedule
+      .ensureMemberRows(groupId, userId)
+      .catch((e) => this.logger.error(e));
+  }
 
   private groupWithMemberCount(
     group: GroupSummary,
@@ -90,7 +109,9 @@ export class GroupsService {
   }
 
   /** Removes pending user created for a failed member invite email (cascades memberships + invitation). */
-  private async rollbackPendingMemberInvite(pendingUserId: string): Promise<void> {
+  private async rollbackPendingMemberInvite(
+    pendingUserId: string,
+  ): Promise<void> {
     await this.prisma.user.delete({ where: { id: pendingUserId } });
   }
 
@@ -214,6 +235,13 @@ export class GroupsService {
             createdById: userId,
             minMembers: dto.minMembers,
             isPublic: dto.isPublic ?? false,
+            ...(process.env.GROUPS_AUTO_VERIFY === 'true'
+              ? {
+                  isVerified: true,
+                  verificationStatus: GroupVerificationStatus.VERIFIED,
+                  verificationReviewedAt: new Date(),
+                }
+              : {}),
           },
           select: groupSelect,
         });
@@ -355,7 +383,7 @@ export class GroupsService {
     }
 
     const groups = await this.prisma.group.findMany({
-      where,
+      where: { AND: [where ?? {}, { deletedAt: null }] },
       select: groupSelect,
       orderBy: { createdAt: 'desc' },
     });
@@ -402,6 +430,9 @@ export class GroupsService {
     if (!group) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
+    if (group.deletedAt && !(await this.isPlatformSuperAdmin(userId))) {
+      throw new NotFoundException(`Group ${groupId} was not found.`);
+    }
 
     const memberCount = await this.countActiveMembers(groupId);
     const row = this.groupWithMemberCount(group, memberCount);
@@ -430,7 +461,7 @@ export class GroupsService {
       where: { id: groupId },
     });
 
-    if (!group) {
+    if (!group || group.deletedAt) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
 
@@ -474,6 +505,7 @@ export class GroupsService {
         membershipStatus: GroupMembershipStatus.ACTIVE,
       },
     });
+    this.ensureMemberSchedule(groupId, userId);
     const joiner = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { fullName: true },
@@ -520,9 +552,7 @@ export class GroupsService {
 
     const memberCount = await this.countActiveMembers(groupId);
     if (memberCount >= group.minMembers) {
-      throw new BadRequestException(
-        'This group has reached its member limit.',
-      );
+      throw new BadRequestException('This group has reached its member limit.');
     }
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -612,6 +642,7 @@ export class GroupsService {
           membershipStatus: GroupMembershipStatus.ACTIVE,
         },
       });
+      this.ensureMemberSchedule(groupId, existing.id);
       void this.notifications
         .notifyUserAddedToGroup({
           userId: existing.id,
@@ -772,7 +803,9 @@ export class GroupsService {
     data: { name?: string; description?: string | null },
   ): Promise<GroupApiRow & { memberCount: number }> {
     if (data.name === undefined && data.description === undefined) {
-      throw new BadRequestException('Provide at least name or description to update.');
+      throw new BadRequestException(
+        'Provide at least name or description to update.',
+      );
     }
     await this.assertGroupAdmin(actorUserId, groupId);
     const group = await this.prisma.group.findUnique({
@@ -786,7 +819,9 @@ export class GroupsService {
       where: { id: groupId },
       data: {
         ...(data.name !== undefined ? { name: data.name } : {}),
-        ...(data.description !== undefined ? { description: data.description } : {}),
+        ...(data.description !== undefined
+          ? { description: data.description }
+          : {}),
       },
       select: groupSelect,
     });
@@ -794,13 +829,108 @@ export class GroupsService {
     return this.groupWithMemberCount(updated, memberCount);
   }
 
-  async deleteGroup(actorUserId: string, groupId: string): Promise<void> {
+  /**
+   * Soft delete (history is kept). Requires typing the group name, and is refused while money
+   * is still moving: open loans, payments awaiting review / MoMo, or loan payouts in progress.
+   * Pending loan applications are cancelled.
+   */
+  async deleteGroup(
+    actorUserId: string,
+    groupId: string,
+    dto: { confirmName: string; reason?: string },
+  ): Promise<void> {
     await this.assertGroupAdmin(actorUserId, groupId);
-    const group = await this.prisma.group.findUnique({ where: { id: groupId } });
-    if (!group) {
+    const group = await this.prisma.group.findUnique({
+      where: { id: groupId },
+    });
+    if (!group || group.deletedAt) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
-    await this.prisma.group.delete({ where: { id: groupId } });
+    if (dto.confirmName.trim() !== group.name.trim()) {
+      throw new BadRequestException(
+        'Type the exact group name to confirm deletion.',
+      );
+    }
+
+    const [openLoans, pendingPayments, pendingPayouts] = await Promise.all([
+      this.prisma.memberLoan.count({
+        where: {
+          groupId,
+          status: { in: [MemberLoanStatus.ACTIVE, MemberLoanStatus.DEFAULTED] },
+        },
+      }),
+      this.prisma.depositRecord.count({
+        where: {
+          groupId,
+          status: {
+            in: [
+              DepositRecordStatus.PENDING,
+              DepositRecordStatus.PENDING_VERIFICATION,
+            ],
+          },
+        },
+      }),
+      this.prisma.loanDisbursement.count({
+        where: { groupId, status: LoanDisbursementStatus.PENDING },
+      }),
+    ]);
+    const blockers: string[] = [];
+    if (openLoans) blockers.push(`${openLoans} open loan(s)`);
+    if (pendingPayments)
+      blockers.push(`${pendingPayments} payment(s) awaiting confirmation`);
+    if (pendingPayouts)
+      blockers.push(`${pendingPayouts} loan payout(s) in progress`);
+    if (blockers.length) {
+      throw new BadRequestException(
+        `This group cannot be deleted yet: ${blockers.join(', ')}. Settle them first.`,
+      );
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.loanApplication.updateMany({
+        where: { groupId, status: LoanApplicationStatus.PENDING },
+        data: { status: LoanApplicationStatus.CANCELLED },
+      }),
+      this.prisma.group.update({
+        where: { id: groupId },
+        data: {
+          deletedAt: new Date(),
+          deletedById: actorUserId,
+          deletionReason: dto.reason?.trim() || null,
+          isPublic: false,
+        },
+      }),
+    ]);
+  }
+
+  /** Super admin: soft-deleted groups. */
+  async listDeletedGroups() {
+    const groups = await this.prisma.group.findMany({
+      where: { deletedAt: { not: null } },
+      select: { ...groupSelect, deletedById: true, deletionReason: true },
+      orderBy: { deletedAt: 'desc' },
+    });
+    return groups.map(({ deletedById, deletionReason, ...g }) => ({
+      ...this.toGroupApiRow(g),
+      deletedById,
+      deletionReason,
+    }));
+  }
+
+  /** Super admin: undo a soft delete. */
+  async restoreGroup(groupId: string): Promise<GroupApiRow> {
+    const group = await this.prisma.group.findUnique({
+      where: { id: groupId },
+    });
+    if (!group) throw new NotFoundException(`Group ${groupId} was not found.`);
+    if (!group.deletedAt)
+      throw new BadRequestException('This group is not deleted.');
+    const updated = await this.prisma.group.update({
+      where: { id: groupId },
+      data: { deletedAt: null, deletedById: null, deletionReason: null },
+      select: groupSelect,
+    });
+    return this.toGroupApiRow(updated);
   }
 
   async listMembers(groupId: string, userId: string) {
@@ -812,8 +942,7 @@ export class GroupsService {
       },
       include: { role: true },
     });
-    const superAdmin =
-      !membership && (await this.isPlatformSuperAdmin(userId));
+    const superAdmin = !membership && (await this.isPlatformSuperAdmin(userId));
 
     if (!membership && !superAdmin) {
       throw new ForbiddenException('You do not have access to this group.');
@@ -983,6 +1112,7 @@ export class GroupsService {
       where: { id: ug.id },
       data: { membershipStatus: GroupMembershipStatus.ACTIVE },
     });
+    this.ensureMemberSchedule(groupId, memberUserId);
   }
 
   async togglePublic(
@@ -1008,21 +1138,158 @@ export class GroupsService {
     return this.toGroupApiRow(updated);
   }
 
-  async verifyGroup(groupId: string): Promise<GroupApiRow> {
+  /** Group admin asks a super admin to verify the group (unlocks money features). */
+  async requestVerification(
+    actorUserId: string,
+    groupId: string,
+    details: {
+      district: string;
+      sector: string;
+      cell?: string;
+      registrationNumber?: string;
+      leaderNationalIds?: string[];
+      documentUrls?: string[];
+      notes?: string;
+    },
+  ): Promise<GroupApiRow> {
+    await this.assertGroupAdmin(actorUserId, groupId);
     const group = await this.prisma.group.findUnique({
       where: { id: groupId },
-      select: groupSelect,
     });
-
-    if (!group) {
+    if (!group || group.deletedAt)
       throw new NotFoundException(`Group ${groupId} was not found.`);
+    if (group.verificationStatus === GroupVerificationStatus.VERIFIED) {
+      throw new BadRequestException('This group is already verified.');
     }
-
+    if (group.verificationStatus === GroupVerificationStatus.PENDING) {
+      throw new BadRequestException(
+        'A verification request is already waiting for review.',
+      );
+    }
     const updated = await this.prisma.group.update({
       where: { id: groupId },
-      data: { isVerified: true },
+      data: {
+        verificationStatus: GroupVerificationStatus.PENDING,
+        verificationRequestedAt: new Date(),
+        verificationDetails: details as Prisma.InputJsonValue,
+        verificationRejectionReason: null,
+        verificationReviewedAt: null,
+        verificationReviewedById: null,
+      },
       select: groupSelect,
     });
+    void this.notifications
+      .notifySuperAdmins({
+        groupId,
+        type: NotificationType.GROUP_VERIFICATION_REQUESTED,
+        title: 'Group verification requested',
+        body: `“${group.name}” (${details.district} / ${details.sector}) asked to be verified.`,
+        metadata: { groupName: group.name },
+      })
+      .catch((e) => this.logger.error(e));
+    return this.toGroupApiRow(updated);
+  }
+
+  /** Super admin queue (default: PENDING requests, oldest first). */
+  async verificationQueue(
+    status: GroupVerificationStatus = GroupVerificationStatus.PENDING,
+  ) {
+    const groups = await this.prisma.group.findMany({
+      where: { verificationStatus: status, deletedAt: null },
+      select: {
+        ...groupSelect,
+        verificationDetails: true,
+        createdBy: {
+          select: { id: true, fullName: true, email: true, phoneNumber: true },
+        },
+      },
+      orderBy: { verificationRequestedAt: 'asc' },
+    });
+    const counts = await this.prisma.userGroup.groupBy({
+      by: ['groupId'],
+      where: {
+        groupId: { in: groups.map((g) => g.id) },
+        membershipStatus: GroupMembershipStatus.ACTIVE,
+      },
+      _count: { _all: true },
+    });
+    const byId = new Map(counts.map((c) => [c.groupId, c._count._all]));
+    return groups.map(({ verificationDetails, createdBy, ...g }) => ({
+      ...this.groupWithMemberCount(g, byId.get(g.id) ?? 0),
+      verificationDetails,
+      createdBy,
+    }));
+  }
+
+  async verifyGroup(
+    groupId: string,
+    reviewerId?: string,
+  ): Promise<GroupApiRow> {
+    const group = await this.prisma.group.findUnique({
+      where: { id: groupId },
+    });
+    if (!group || group.deletedAt) {
+      throw new NotFoundException(`Group ${groupId} was not found.`);
+    }
+    const updated = await this.prisma.group.update({
+      where: { id: groupId },
+      data: {
+        isVerified: true,
+        verificationStatus: GroupVerificationStatus.VERIFIED,
+        verificationReviewedAt: new Date(),
+        verificationReviewedById: reviewerId ?? null,
+        verificationRejectionReason: null,
+      },
+      select: groupSelect,
+    });
+    void this.notifications
+      .notifyGroupAdmins({
+        groupId,
+        type: NotificationType.GROUP_VERIFIED,
+        title: 'Group verified',
+        body: `“${group.name}” is verified. You can now set contribution and loan rules.`,
+        metadata: { groupName: group.name },
+      })
+      .catch((e) => this.logger.error(e));
+    return this.toGroupApiRow(updated);
+  }
+
+  async rejectVerification(
+    groupId: string,
+    reviewerId: string,
+    reason: string,
+  ): Promise<GroupApiRow> {
+    const group = await this.prisma.group.findUnique({
+      where: { id: groupId },
+    });
+    if (!group || group.deletedAt) {
+      throw new NotFoundException(`Group ${groupId} was not found.`);
+    }
+    if (group.verificationStatus !== GroupVerificationStatus.PENDING) {
+      throw new BadRequestException(
+        'Only a pending verification request can be rejected.',
+      );
+    }
+    const updated = await this.prisma.group.update({
+      where: { id: groupId },
+      data: {
+        isVerified: false,
+        verificationStatus: GroupVerificationStatus.REJECTED,
+        verificationReviewedAt: new Date(),
+        verificationReviewedById: reviewerId,
+        verificationRejectionReason: reason.trim(),
+      },
+      select: groupSelect,
+    });
+    void this.notifications
+      .notifyGroupAdmins({
+        groupId,
+        type: NotificationType.GROUP_VERIFICATION_REJECTED,
+        title: 'Verification not approved',
+        body: `“${group.name}” was not verified: ${reason.trim()}. Update the details and request again.`,
+        metadata: { groupName: group.name, reason: reason.trim() },
+      })
+      .catch((e) => this.logger.error(e));
     return this.toGroupApiRow(updated);
   }
 
@@ -1031,7 +1298,7 @@ export class GroupsService {
       where: { id: groupId },
     });
 
-    if (!group) {
+    if (!group || group.deletedAt) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
 
@@ -1072,7 +1339,7 @@ export class GroupsService {
       where: { id: groupId },
     });
 
-    if (!group) {
+    if (!group || group.deletedAt) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
 

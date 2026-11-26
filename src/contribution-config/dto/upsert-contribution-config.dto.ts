@@ -36,7 +36,9 @@ export class UpsertContributionConfigDto {
   @IsDateString()
   startDate!: string;
 
-  @ApiPropertyOptional({ description: '0 = Sunday … 6 = Saturday (weekly / biweekly)' })
+  @ApiPropertyOptional({
+    description: '0 = Sunday … 6 = Saturday (weekly / biweekly)',
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -44,7 +46,9 @@ export class UpsertContributionConfigDto {
   @Max(6)
   dayOfWeek?: number;
 
-  @ApiPropertyOptional({ description: 'Day of month for monthly interval (1–31)' })
+  @ApiPropertyOptional({
+    description: 'Day of month for monthly interval (1–31)',
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -72,4 +76,15 @@ export class UpsertContributionConfigDto {
   @IsInt()
   @Min(0)
   gracePeriodDays!: number;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description: 'In-app reminder N days before each due date (0 = off)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(30)
+  reminderDaysBefore?: number;
 }

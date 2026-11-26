@@ -32,6 +32,12 @@ import { GroupResponseDto } from './dto/group-response.dto';
 import { InviteMemberDto } from './dto/invite-member.dto';
 import { MemberActionReasonDto } from './dto/member-action-reason.dto';
 import { UpdateGroupDto } from './dto/update-group.dto';
+import {
+  DeleteGroupDto,
+  RejectVerificationDto,
+  RequestVerificationDto,
+  VerificationQueueQueryDto,
+} from './dto/group-lifecycle.dto';
 import { GroupsService } from './groups.service';
 
 @ApiTags('groups')
@@ -79,7 +85,8 @@ export class GroupsController {
 
   @Get('removal-notifications')
   @ApiOperation({
-    summary: 'List removal or suspension notices for the current user (groups only)',
+    summary:
+      'List removal or suspension notices for the current user (groups only)',
   })
   @ApiOkResponse({ description: 'Notifications for the signed-in user' })
   listRemovalNotifications(@CurrentUser() user: AuthenticatedUser) {
@@ -95,7 +102,10 @@ export class GroupsController {
     @CurrentUser() user: AuthenticatedUser,
     @Param('notificationId') notificationId: string,
   ) {
-    return this.groupsService.markRemovalNotificationRead(user.id, notificationId);
+    return this.groupsService.markRemovalNotificationRead(
+      user.id,
+      notificationId,
+    );
   }
 
   @Get(':groupId/members')
@@ -130,15 +140,71 @@ export class GroupsController {
   @Delete(':groupId')
   @GroupRole(RoleName.GROUP_ADMIN)
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete the group (GROUP_ADMIN only)' })
+  @ApiOperation({
+    summary:
+      'Soft-delete the group (GROUP_ADMIN only). Body must repeat the group name. Refused while loans, payments or payouts are open; history is kept and a super admin can restore it.',
+  })
   @ApiParam({ name: 'groupId', type: String })
   @ApiNoContentResponse({ description: 'Group deleted' })
   @ApiForbiddenResponse({ description: 'Not group admin' })
   deleteGroup(
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
+    @Body() dto: DeleteGroupDto,
   ) {
-    return this.groupsService.deleteGroup(user.id, groupId);
+    return this.groupsService.deleteGroup(user.id, groupId, dto);
+  }
+
+  @Get('admin/deleted')
+  @Roles(RoleName.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Super admin: soft-deleted groups' })
+  listDeleted() {
+    return this.groupsService.listDeletedGroups();
+  }
+
+  @Patch(':groupId/restore')
+  @Roles(RoleName.SUPER_ADMIN)
+  @ApiOperation({ summary: 'Super admin: restore a soft-deleted group' })
+  @ApiParam({ name: 'groupId', type: String })
+  restore(@Param('groupId') groupId: string) {
+    return this.groupsService.restoreGroup(groupId);
+  }
+
+  @Post(':groupId/verification-request')
+  @GroupRole(RoleName.GROUP_ADMIN)
+  @ApiOperation({
+    summary: 'Group admin: ask a super admin to verify the group',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  requestVerification(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Body() dto: RequestVerificationDto,
+  ) {
+    return this.groupsService.requestVerification(user.id, groupId, dto);
+  }
+
+  @Get('admin/verification-queue')
+  @Roles(RoleName.SUPER_ADMIN)
+  @ApiOperation({
+    summary: 'Super admin: groups by verification status (default PENDING)',
+  })
+  verificationQueue(@Query() q: VerificationQueueQueryDto) {
+    return this.groupsService.verificationQueue(q.status);
+  }
+
+  @Patch(':groupId/verification/reject')
+  @Roles(RoleName.SUPER_ADMIN)
+  @ApiOperation({
+    summary: 'Super admin: reject a pending verification request with a reason',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  rejectVerification(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Body() dto: RejectVerificationDto,
+  ) {
+    return this.groupsService.rejectVerification(groupId, user.id, dto.reason);
   }
 
   @Delete(':groupId/members/:memberUserId')
@@ -255,8 +321,11 @@ export class GroupsController {
   @ApiNotFoundResponse({ description: 'Group not found' })
   @ApiUnauthorizedResponse({ description: 'Unauthorized' })
   @ApiForbiddenResponse({ description: 'Forbidden' })
-  verify(@Param('groupId') groupId: string) {
-    return this.groupsService.verifyGroup(groupId);
+  verify(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+  ) {
+    return this.groupsService.verifyGroup(groupId, user.id);
   }
 
   @Patch(':groupId/toggle-public')

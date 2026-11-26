@@ -11,6 +11,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { GroupsService } from '../groups/groups.service';
+import { ContributionScheduleService } from '../finance-core/contribution-schedule.service';
 import { UpsertContributionConfigDto } from './dto/upsert-contribution-config.dto';
 
 function decimalToNumber(value: Prisma.Decimal): number {
@@ -22,6 +23,7 @@ export class ContributionConfigService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly groupsService: GroupsService,
+    private readonly schedule: ContributionScheduleService,
   ) {}
 
   /**
@@ -91,10 +93,8 @@ export class ContributionConfigService {
 
     const currency = (dto.currency ?? 'RWF').trim() || 'RWF';
 
-    const dayOfWeek =
-      dto.dayOfWeek !== undefined ? dto.dayOfWeek : null;
-    const dayOfMonth =
-      dto.dayOfMonth !== undefined ? dto.dayOfMonth : null;
+    const dayOfWeek = dto.dayOfWeek !== undefined ? dto.dayOfWeek : null;
+    const dayOfMonth = dto.dayOfMonth !== undefined ? dto.dayOfMonth : null;
 
     const config = await this.prisma.contributionConfig.upsert({
       where: { groupId },
@@ -109,6 +109,9 @@ export class ContributionConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         latePenaltyRate: latePenalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.reminderDaysBefore !== undefined
+          ? { reminderDaysBefore: dto.reminderDaysBefore }
+          : {}),
       },
       update: {
         amount: new Prisma.Decimal(dto.amount),
@@ -120,8 +123,14 @@ export class ContributionConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         latePenaltyRate: latePenalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.reminderDaysBefore !== undefined
+          ? { reminderDaysBefore: dto.reminderDaysBefore }
+          : {}),
       },
     });
+
+    // Regenerate untouched future periods (history and partly paid rows are kept).
+    await this.schedule.onConfigChanged(groupId);
 
     return this.toResponse(config);
   }
@@ -138,6 +147,7 @@ export class ContributionConfigService {
     allowPartialPayments: boolean;
     latePenaltyRate: Prisma.Decimal | null;
     gracePeriodDays: number;
+    reminderDaysBefore: number;
     createdAt: Date;
     updatedAt: Date;
   }) {
@@ -156,6 +166,7 @@ export class ContributionConfigService {
           ? null
           : decimalToNumber(config.latePenaltyRate),
       gracePeriodDays: config.gracePeriodDays,
+      reminderDaysBefore: config.reminderDaysBefore,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
     };

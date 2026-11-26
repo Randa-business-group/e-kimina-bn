@@ -131,11 +131,7 @@ export class ContributionsService {
     return this.toResponse(row);
   }
 
-  async create(
-    actorId: string,
-    groupId: string,
-    dto: CreateContributionDto,
-  ) {
+  async create(actorId: string, groupId: string, dto: CreateContributionDto) {
     await this.groupsService.assertUserCanAccessContributionConfig(
       actorId,
       groupId,
@@ -161,14 +157,23 @@ export class ContributionsService {
     }
 
     const status = dto.status ?? ContributionStatus.PENDING;
-    const paidAt =
-      status === ContributionStatus.PAID ? new Date() : null;
+    if (status === ContributionStatus.PARTIALLY_PAID) {
+      throw new BadRequestException(
+        'PARTIALLY_PAID is set by payments, not manually.',
+      );
+    }
+    const paidAt = status === ContributionStatus.PAID ? new Date() : null;
 
     const created = await this.prisma.contribution.create({
       data: {
         userId: dto.userId,
         groupId,
         amount: new Prisma.Decimal(dto.amount),
+        // Marked PAID by a leader = settled off-platform.
+        amountPaid:
+          status === ContributionStatus.PAID
+            ? new Prisma.Decimal(dto.amount)
+            : 0,
         dueDate,
         status,
         paidAt,
@@ -198,8 +203,25 @@ export class ContributionsService {
       throw new NotFoundException('Contribution not found.');
     }
 
-    let status = dto.status ?? existing.status;
+    const status = dto.status ?? existing.status;
     let paidAt: Date | null = existing.paidAt;
+
+    if (
+      status === ContributionStatus.PARTIALLY_PAID &&
+      existing.status !== status
+    ) {
+      throw new BadRequestException(
+        'PARTIALLY_PAID is set by payments, not manually.',
+      );
+    }
+    const allocated = await this.prisma.depositAllocation.count({
+      where: { contributionId },
+    });
+    if (allocated > 0 && status !== existing.status) {
+      throw new BadRequestException(
+        'This period already received money from a payment; its status follows the payments and cannot be changed by hand.',
+      );
+    }
 
     if (dto.paidAt !== undefined) {
       if (dto.paidAt === null) {
@@ -226,6 +248,12 @@ export class ContributionsService {
       data: {
         status,
         paidAt,
+        ...(allocated === 0
+          ? {
+              amountPaid:
+                status === ContributionStatus.PAID ? existing.amount : 0,
+            }
+          : {}),
       },
       include: { user: { select: userSelect } },
     });
@@ -239,6 +267,11 @@ export class ContributionsService {
       userId: row.userId,
       groupId: row.groupId,
       amount: decimalToNumber(row.amount),
+      amountPaid: decimalToNumber(row.amountPaid),
+      remaining: Math.max(
+        0,
+        decimalToNumber(row.amount) - decimalToNumber(row.amountPaid),
+      ),
       dueDate: row.dueDate,
       paidAt: row.paidAt,
       status: row.status,
