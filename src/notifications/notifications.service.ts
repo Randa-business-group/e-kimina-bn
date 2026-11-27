@@ -2,16 +2,91 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   GroupMembershipStatus,
   NotificationAudience,
+  NotificationChannel,
   NotificationType,
   RoleName,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  NotificationDeliveryService,
+  type DeliveryItem,
+} from './delivery.service';
+import { MANDATORY_IN_APP } from './notification-catalog';
 
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly delivery: NotificationDeliveryService,
+  ) {}
+
+  /**
+   * Inserts the in-app rows (skipping users who muted the category in the app) and hands
+   * every recipient to the delivery service for email / SMS / push (msfts §7).
+   */
+  private async insertAndDeliver(
+    rows: {
+      userId: string;
+      groupId: string | null;
+      type: NotificationType;
+      audience: NotificationAudience;
+      title: string;
+      body: string;
+      metadata?: object | null;
+    }[],
+    opts: { onlyChannels?: NotificationChannel[] } = {},
+  ): Promise<number> {
+    if (rows.length === 0) return 0;
+    const muted = new Set<string>();
+    for (const type of new Set(rows.map((r) => r.type))) {
+      if (MANDATORY_IN_APP.has(type)) continue;
+      const ids = rows.filter((r) => r.type === type).map((r) => r.userId);
+      for (const id of await this.delivery.inAppMuted(ids, type)) {
+        muted.add(`${type}:${id}`);
+      }
+    }
+    const visible = rows.filter((r) => !muted.has(`${r.type}:${r.userId}`));
+    let created: { id: string; userId: string; type: NotificationType }[] = [];
+    try {
+      created = visible.length
+        ? await this.prisma.userNotification.createManyAndReturn({
+            data: visible.map((r) => ({
+              userId: r.userId,
+              groupId: r.groupId,
+              type: r.type,
+              audience: r.audience,
+              title: r.title,
+              body: r.body,
+              ...(r.metadata != null && { metadata: r.metadata }),
+            })),
+            select: { id: true, userId: true, type: true },
+          })
+        : [];
+    } catch (e) {
+      this.logger.error(
+        `userNotification insert failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    // RETURNING keeps insertion order, so created[i] belongs to visible[i].
+    const idOf = new Map<object, string>();
+    visible.forEach((r, i) => {
+      const c = created[i];
+      if (c && c.userId === r.userId && c.type === r.type) idOf.set(r, c.id);
+    });
+    const items: DeliveryItem[] = rows.map((r) => ({
+      id: idOf.get(r) ?? null,
+      userId: r.userId,
+      groupId: r.groupId,
+      type: r.type,
+      title: r.title,
+      body: r.body,
+      metadata: r.metadata,
+    }));
+    void this.delivery.dispatch(items, opts);
+    return created.length;
+  }
 
   private async userIdsByRoles(
     groupId: string,
@@ -39,24 +114,9 @@ export class NotificationsService {
       metadata?: object | null;
     },
   ) {
-    if (userIds.length === 0) return;
-    try {
-      await this.prisma.userNotification.createMany({
-        data: userIds.map((userId) => ({
-          userId,
-          groupId: row.groupId,
-          type: row.type,
-          audience: row.audience,
-          title: row.title,
-          body: row.body,
-          ...(row.metadata != null && { metadata: row.metadata }),
-        })),
-      });
-    } catch (e) {
-      this.logger.error(
-        `userNotification createMany failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
+    await this.insertAndDeliver(
+      [...new Set(userIds)].map((userId) => ({ userId, ...row })),
+    );
   }
 
   private async createOne(
@@ -504,6 +564,248 @@ export class NotificationsService {
         metadata: meta,
       },
     );
+  }
+
+  /** Generic: one notification to one member (audience MEMBER). */
+  async notifyMember(p: {
+    userId: string;
+    groupId: string | null;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    await this.createOne(p.userId, {
+      groupId: p.groupId,
+      type: p.type,
+      audience: NotificationAudience.MEMBER,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    });
+  }
+
+  /** Generic: all active group admins and treasurers (optionally excluding one user). */
+  async notifyFinanceLeaders(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+    excludeUserId?: string;
+  }) {
+    const admins = (
+      await this.userIdsByRoles(p.groupId, [RoleName.GROUP_ADMIN])
+    ).filter((id) => id !== p.excludeUserId);
+    const treasurers = (
+      await this.userIdsByRoles(p.groupId, [RoleName.TREASURER])
+    ).filter((id) => id !== p.excludeUserId && !admins.includes(id));
+    const base = {
+      groupId: p.groupId,
+      type: p.type,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    };
+    await this.createMany(admins, {
+      ...base,
+      audience: NotificationAudience.GROUP_ADMIN,
+    });
+    await this.createMany(treasurers, {
+      ...base,
+      audience: NotificationAudience.TREASURER,
+    });
+  }
+
+  /** Generic: only the group admins of a group. */
+  async notifyGroupAdmins(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    const admins = await this.userIdsByRoles(p.groupId, [RoleName.GROUP_ADMIN]);
+    await this.createMany(admins, {
+      groupId: p.groupId,
+      type: p.type,
+      audience: NotificationAudience.GROUP_ADMIN,
+      title: p.title,
+      body: p.body,
+      metadata: p.metadata,
+    });
+  }
+
+  /** Generic: every active platform super admin. */
+  async notifySuperAdmins(p: {
+    groupId: string | null;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+  }) {
+    const rows = await this.prisma.userPlatformRole.findMany({
+      where: { role: { name: RoleName.SUPER_ADMIN }, user: { isActive: true } },
+      select: { userId: true },
+    });
+    await this.createMany(
+      rows.map((r) => r.userId),
+      {
+        groupId: p.groupId,
+        type: p.type,
+        audience: NotificationAudience.SUPER_ADMIN,
+        title: p.title,
+        body: p.body,
+        metadata: p.metadata,
+      },
+    );
+  }
+
+  /** Generic: every active member of a group (audience MEMBER), optionally excluding one. */
+  async notifyAllMembers(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+    excludeUserId?: string;
+  }) {
+    const rows = await this.prisma.userGroup.findMany({
+      where: {
+        groupId: p.groupId,
+        membershipStatus: GroupMembershipStatus.ACTIVE,
+        ...(p.excludeUserId ? { userId: { not: p.excludeUserId } } : {}),
+      },
+      select: { userId: true },
+    });
+    await this.createMany(
+      rows.map((r) => r.userId),
+      {
+        groupId: p.groupId,
+        type: p.type,
+        audience: NotificationAudience.MEMBER,
+        title: p.title,
+        body: p.body,
+        metadata: p.metadata,
+      },
+    );
+  }
+
+  /** Bulk insert of pre-built member notifications (scheduler). */
+  async createMemberNotificationsBulk(
+    rows: {
+      userId: string;
+      groupId: string;
+      type: NotificationType;
+      title: string;
+      body: string;
+      metadata?: object | null;
+    }[],
+  ) {
+    await this.insertAndDeliver(
+      rows.map((r) => ({ ...r, audience: NotificationAudience.MEMBER })),
+    );
+  }
+
+  /** Group announcement to every active member (msfts §7). Returns recipients. */
+  async broadcastToGroup(p: {
+    groupId: string;
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: object | null;
+    extraChannels: NotificationChannel[];
+  }): Promise<number> {
+    const members = await this.prisma.userGroup.findMany({
+      where: {
+        groupId: p.groupId,
+        membershipStatus: GroupMembershipStatus.ACTIVE,
+      },
+      select: { userId: true },
+    });
+    await this.insertAndDeliver(
+      members.map((m) => ({
+        userId: m.userId,
+        groupId: p.groupId,
+        type: p.type,
+        audience: NotificationAudience.MEMBER,
+        title: p.title,
+        body: p.body,
+        metadata: p.metadata,
+      })),
+      { onlyChannels: p.extraChannels },
+    );
+    return members.length;
+  }
+
+  /** Removal / suspension / reactivation notice to the member concerned. */
+  async notifyMembershipChange(p: {
+    userId: string;
+    groupId: string;
+    groupName: string;
+    kind: 'REMOVED' | 'SUSPENDED' | 'REACTIVATED';
+    reason?: string;
+  }) {
+    const type =
+      p.kind === 'REMOVED'
+        ? NotificationType.REMOVED_FROM_GROUP
+        : p.kind === 'SUSPENDED'
+          ? NotificationType.SUSPENDED_IN_GROUP
+          : NotificationType.MEMBERSHIP_REACTIVATED;
+    const title =
+      p.kind === 'REMOVED'
+        ? `Removed from ${p.groupName}`
+        : p.kind === 'SUSPENDED'
+          ? `Suspended in ${p.groupName}`
+          : `Welcome back to ${p.groupName}`;
+    await this.insertAndDeliver([
+      {
+        userId: p.userId,
+        groupId: p.groupId,
+        type,
+        audience: NotificationAudience.MEMBER,
+        title,
+        body: p.reason ?? 'Your membership is active again.',
+        metadata: {
+          groupName: p.groupName,
+          kind: p.kind,
+          reason: p.reason ?? null,
+        },
+      },
+    ]);
+  }
+
+  /** Former GroupRemovalNotification list, now read from UserNotification. */
+  async listMembershipNotices(userId: string) {
+    const rows = await this.prisma.userNotification.findMany({
+      where: {
+        userId,
+        type: {
+          in: [
+            NotificationType.REMOVED_FROM_GROUP,
+            NotificationType.SUSPENDED_IN_GROUP,
+          ],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    return rows.map((r) => {
+      const m = (r.metadata ?? {}) as { groupName?: string; reason?: string };
+      return {
+        id: r.id,
+        groupId: r.groupId ?? '',
+        groupName:
+          m.groupName ?? r.title.replace(/^(Removed from|Suspended in) /, ''),
+        kind:
+          r.type === NotificationType.REMOVED_FROM_GROUP
+            ? 'REMOVED'
+            : 'SUSPENDED',
+        reason: m.reason ?? r.body,
+        readAt: r.readAt,
+        createdAt: r.createdAt,
+      };
+    });
   }
 
   async listForUser(

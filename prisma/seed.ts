@@ -3,6 +3,17 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient, RoleName } from '@prisma/client';
 import { hash } from 'bcryptjs';
 import pg from 'pg';
+import { removeDetailedGroup, seedDetailedGroup } from './newseed';
+
+/**
+ * Detailed demo group (prisma/newseed.ts): 1 group admin, 1 treasurer, 20 members
+ * with full weekly history from 1 Jan 2026 to today.
+ *   - Set to false (or run with SEED_DETAILED=false) to skip it.
+ *   - To wipe it from the DB, set REMOVE_DETAILED_SEED = true (or SEED_DETAILED=remove).
+ *   - To drop it completely, delete this block, the import above and the call in main().
+ */
+const RUN_DETAILED_SEED = process.env.SEED_DETAILED !== 'false';
+const REMOVE_DETAILED_SEED = process.env.SEED_DETAILED === 'remove';
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
@@ -125,7 +136,8 @@ async function main(): Promise<void> {
           'Seeded group: GROUP_ADMIN, TREASURER, MEMBER (one user per role).',
         createdById: groupAdminUser.id,
         isVerified: true,
-        minMembers: 100,
+        verificationStatus: 'VERIFIED',
+        maxMembers: 100,
       },
     });
   }
@@ -193,6 +205,13 @@ Seeded ${SEED_USERS.length} users (password for all: "${SEED_PASSWORD}")
         `  ${def.role.padEnd(12)} → ${u.email}  (UserGroup in "${SEED_GROUP_NAME}")`,
       );
     }
+  }
+
+  // ── Detailed demo group (prisma/newseed.ts) ──
+  if (REMOVE_DETAILED_SEED) {
+    await removeDetailedGroup(prisma, { deleteUsers: true });
+  } else if (RUN_DETAILED_SEED) {
+    await seedDetailedGroup(prisma, { passwordHash });
   }
 }
 

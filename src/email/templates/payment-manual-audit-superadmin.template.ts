@@ -15,7 +15,9 @@ export function renderManualDepositAuditGroupAdminEmail(
   const { appName } = getEmailConfig();
   const safe = (s: string) => escapeHtml(s);
   const isReject = kind === 'REJECTED';
-  const title = isReject ? 'Manual payment rejected' : 'Manual payment confirmed';
+  const title = isReject
+    ? 'Manual payment rejected'
+    : 'Manual payment confirmed';
   const lead = isReject
     ? `A group admin <strong>rejected</strong> a manual deposit in <strong>${safe(groupName)}</strong>.`
     : `A group admin <strong>confirmed</strong> a manual deposit in <strong>${safe(groupName)}</strong>.`;

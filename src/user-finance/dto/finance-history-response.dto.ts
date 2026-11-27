@@ -4,7 +4,9 @@ export class FinanceHistoryItemDto {
   @ApiProperty() id!: string;
   @ApiProperty() groupId!: string;
   @ApiProperty() groupName!: string;
-  @ApiProperty({ description: "CONTRIBUTION | LOAN_REPAYMENT | PENALTY | DEPOSIT" })
+  @ApiProperty({
+    description: 'CONTRIBUTION | LOAN_REPAYMENT | PENALTY | DEPOSIT',
+  })
   type!: string;
   @ApiProperty() amount!: number;
   @ApiProperty() currency!: string;

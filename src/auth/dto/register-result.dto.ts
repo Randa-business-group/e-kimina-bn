@@ -1,5 +1,4 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { UserResponseDto } from '../../users/dto/user-response.dto';
 
 /** Normal sign-up: verify email with OTP before receiving a JWT. */
 export class RegisterPendingDto {

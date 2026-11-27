@@ -85,6 +85,28 @@ export class LoanConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         penaltyRate: penalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.penaltyPeriodDays !== undefined
+          ? { penaltyPeriodDays: dto.penaltyPeriodDays }
+          : {}),
+        ...(dto.defaultAfterDays !== undefined
+          ? { defaultAfterDays: dto.defaultAfterDays }
+          : {}),
+        ...(dto.blockIfArrears !== undefined
+          ? { blockIfArrears: dto.blockIfArrears }
+          : {}),
+        ...(dto.interestMethod !== undefined
+          ? { interestMethod: dto.interestMethod }
+          : {}),
+        ...(dto.installmentInterval !== undefined
+          ? { installmentInterval: dto.installmentInterval }
+          : {}),
+        ...(dto.guarantorsRequired !== undefined
+          ? { guarantorsRequired: dto.guarantorsRequired }
+          : {}),
+        ...(dto.allowTopUp !== undefined ? { allowTopUp: dto.allowTopUp } : {}),
+        ...(dto.earlyRepaymentRebatePercent !== undefined
+          ? { earlyRepaymentRebatePercent: dto.earlyRepaymentRebatePercent }
+          : {}),
       },
       update: {
         interestRate: new Prisma.Decimal(dto.interestRate),
@@ -94,6 +116,28 @@ export class LoanConfigService {
         allowPartialPayments: dto.allowPartialPayments,
         penaltyRate: penalty,
         gracePeriodDays: dto.gracePeriodDays,
+        ...(dto.penaltyPeriodDays !== undefined
+          ? { penaltyPeriodDays: dto.penaltyPeriodDays }
+          : {}),
+        ...(dto.defaultAfterDays !== undefined
+          ? { defaultAfterDays: dto.defaultAfterDays }
+          : {}),
+        ...(dto.blockIfArrears !== undefined
+          ? { blockIfArrears: dto.blockIfArrears }
+          : {}),
+        ...(dto.interestMethod !== undefined
+          ? { interestMethod: dto.interestMethod }
+          : {}),
+        ...(dto.installmentInterval !== undefined
+          ? { installmentInterval: dto.installmentInterval }
+          : {}),
+        ...(dto.guarantorsRequired !== undefined
+          ? { guarantorsRequired: dto.guarantorsRequired }
+          : {}),
+        ...(dto.allowTopUp !== undefined ? { allowTopUp: dto.allowTopUp } : {}),
+        ...(dto.earlyRepaymentRebatePercent !== undefined
+          ? { earlyRepaymentRebatePercent: dto.earlyRepaymentRebatePercent }
+          : {}),
       },
     });
 
@@ -110,6 +154,14 @@ export class LoanConfigService {
     allowPartialPayments: boolean;
     penaltyRate: Prisma.Decimal | null;
     gracePeriodDays: number;
+    penaltyPeriodDays: number;
+    defaultAfterDays: number | null;
+    blockIfArrears: boolean;
+    interestMethod: string;
+    installmentInterval: string;
+    guarantorsRequired: number;
+    allowTopUp: boolean;
+    earlyRepaymentRebatePercent: number;
     createdAt: Date;
     updatedAt: Date;
   }) {
@@ -127,6 +179,14 @@ export class LoanConfigService {
       penaltyRate:
         config.penaltyRate == null ? null : decimalToNumber(config.penaltyRate),
       gracePeriodDays: config.gracePeriodDays,
+      penaltyPeriodDays: config.penaltyPeriodDays,
+      defaultAfterDays: config.defaultAfterDays,
+      blockIfArrears: config.blockIfArrears,
+      interestMethod: config.interestMethod,
+      installmentInterval: config.installmentInterval,
+      guarantorsRequired: config.guarantorsRequired,
+      allowTopUp: config.allowTopUp,
+      earlyRepaymentRebatePercent: config.earlyRepaymentRebatePercent,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
     };

@@ -24,13 +24,13 @@ function pickFrontendUrl(): string {
     process.env.FRONTEND_URL?.trim() || process.env.NEXT_PUBLIC_APP_URL?.trim();
   if (direct) return direct;
 
-  const corsFirst = (process.env.CORS_ORIGINS ?? "")
-    .split(",")
+  const corsFirst = (process.env.CORS_ORIGINS ?? '')
+    .split(',')
     .map((v) => v.trim())
     .find((v) => v.length > 0);
   if (corsFirst) return corsFirst;
 
-  return "http://localhost:3000";
+  return 'http://localhost:3033';
 }
 
 /**
@@ -55,8 +55,8 @@ export function getEmailConfig(): EmailConfig {
         name: process.env.SMTP_FROM_NAME ?? '',
       },
     },
-    appUrl: process.env.APP_URL || 'http://localhost:4000',
+    appUrl: process.env.APP_URL || 'http://localhost:4033',
     frontendUrl: pickFrontendUrl(),
-    appName: process.env.APP_NAME || 'nest-app',
+    appName: process.env.APP_NAME || 'E-kimina',
   };
 }

@@ -53,7 +53,7 @@ export function renderTemplate(
 ): string {
   loadTemplates();
 
-  const appName = process.env.APP_NAME || 'Fasta';
+  const appName = process.env.APP_NAME || 'E-kimina';
   const logoUrl = process.env.APP_LOGO_URL || '';
   const logoHtml = logoUrl
     ? `<img src="${logoUrl}" alt="${appName}" class="logo-img" />`
@@ -61,7 +61,7 @@ export function renderTemplate(
 
   const defaultOptions: TemplateOptions = {
     appName,
-    appUrl: process.env.APP_URL || 'http://localhost:4000',
+    appUrl: process.env.APP_URL || 'http://localhost:4033',
     year: new Date().getFullYear(),
     subject: `Email from ${appName}`,
     logoHtml,

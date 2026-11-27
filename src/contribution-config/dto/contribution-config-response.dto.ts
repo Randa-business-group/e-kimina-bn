@@ -20,16 +20,28 @@ export class ContributionConfigResponseDto {
   @ApiProperty({ type: String, format: 'date-time' })
   startDate!: Date;
 
-  @ApiPropertyOptional({ type: Number, nullable: true, description: '0–6 for weekly / biweekly' })
+  @ApiPropertyOptional({
+    type: Number,
+    nullable: true,
+    description: '0–6 for weekly / biweekly',
+  })
   dayOfWeek!: number | null;
 
-  @ApiPropertyOptional({ type: Number, nullable: true, description: '1–31 for monthly' })
+  @ApiPropertyOptional({
+    type: Number,
+    nullable: true,
+    description: '1–31 for monthly',
+  })
   dayOfMonth!: number | null;
 
   @ApiProperty()
   allowPartialPayments!: boolean;
 
-  @ApiPropertyOptional({ type: Number, nullable: true, description: 'Late penalty % per period' })
+  @ApiPropertyOptional({
+    type: Number,
+    nullable: true,
+    description: 'Late penalty % per period',
+  })
   latePenaltyRate!: number | null;
 
   @ApiProperty()

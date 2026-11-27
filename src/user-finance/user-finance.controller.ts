@@ -20,9 +20,20 @@ import { UserFinanceService } from './user-finance.service';
 export class UserFinanceController {
   constructor(private readonly userFinance: UserFinanceService) {}
 
+  @Get('dashboard')
+  @ApiOperation({
+    summary:
+      'Dashboard home: my groups, totals, upcoming, recent activity, savings series, meetings',
+  })
+  @ApiUnauthorizedResponse()
+  getDashboard(@CurrentUser() user: AuthenticatedUser) {
+    return this.userFinance.getDashboard(user.id);
+  }
+
   @Get('summary')
   @ApiOperation({
-    summary: 'Per-group contribution totals, penalties (late) for verified memberships',
+    summary:
+      'Per-group contribution totals, penalties (late) for verified memberships',
   })
   @ApiOkResponse({ type: UserFinanceSummaryResponseDto })
   @ApiUnauthorizedResponse()
@@ -32,7 +43,8 @@ export class UserFinanceController {
 
   @Get('history')
   @ApiOperation({
-    summary: 'Paginated history: paid contributions and confirmed bank deposits',
+    summary:
+      'Paginated history: paid contributions and confirmed bank deposits',
   })
   @ApiOkResponse({ type: UserFinanceHistoryResponseDto })
   @ApiUnauthorizedResponse()
@@ -49,7 +61,8 @@ export class UserFinanceController {
 
   @Get('upcoming')
   @ApiOperation({
-    summary: 'Open contributions, penalties, and manual deposits awaiting admin confirmation',
+    summary:
+      'Open contributions, penalties, and manual deposits awaiting admin confirmation',
   })
   @ApiOkResponse({ type: UserFinanceUpcomingResponseDto })
   @ApiUnauthorizedResponse()
