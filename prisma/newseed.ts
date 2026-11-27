@@ -15,6 +15,9 @@
  *     ACTIVE overdue with penalty, DEFAULTED, REJECTED, and PENDING
  *     (no approvals / admin-only / treasurer-only)
  *   - Loan repayments (MoMo, manual confirmed, manual pending)
+ *   - Group accounting: savings cycle "Cycle 2026", monthly social fund (1,000 RWF) with its
+ *     own payments, group expenses (approved / pending / rejected), social payouts and a full
+ *     ledger (cash book) rebuilt from all of the above
  *   - Fine rows (paid late fines + open fines on LATE rows), DepositAllocation rows for every
  *     confirmed deposit, LoanDisbursement rows; loan due dates count from disbursement
  *   - In-app UserNotifications matching what the services would have produced
@@ -35,20 +38,41 @@ import {
   DepositPaymentMethod,
   DepositPurpose,
   DepositRecordStatus,
+  ExpenseCategory,
+  ExpenseStatus,
   FineStatus,
+  FundType,
   FineType,
   GroupVerificationStatus,
+  InstallmentInterval,
+  InstallmentStatus,
+  InterestMethod,
   LoanDisbursementMethod,
   LoanDisbursementStatus,
+  AttendanceStatus,
+  ExitKind,
+  FineType as FineTypeEnum,
   GroupMembershipStatus,
   LoanApplicationStatus,
+  MeetingStatus,
+  PollKind,
+  PollStatus,
   MemberLoanStatus,
   NotificationAudience,
   NotificationType,
   Prisma,
   PrismaClient,
   RoleName,
+  SocialPayoutReason,
+  SocialPayoutStatus,
 } from '@prisma/client';
+import { backfillGroupLedger } from '../src/finance-core/ledger';
+import {
+  buildSchedule,
+  fillInstallments,
+  installmentPenalty,
+  instTotal,
+} from '../src/finance-core/loan-schedule';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -81,9 +105,22 @@ const LOAN = {
   penaltyRate: 2, // % of outstanding per 30 days overdue (after grace)
   gracePeriodDays: 7,
   penaltyPeriodDays: 30,
-  defaultAfterDays: 120, // DEFAULTED 120 days after due date + grace
+  defaultAfterDays: 120, // DEFAULTED 120 days after the oldest overdue installment (+ grace)
   blockIfArrears: true,
+  installmentInterval: InstallmentInterval.MONTHLY, // 3 monthly installments over 90 days
+  interestMethod: InterestMethod.FLAT,
+  earlyRepaymentRebatePercent: 50,
+  allowTopUp: true,
 };
+
+const SOCIAL_FUND = {
+  amount: 1_000,
+  dayOfMonth: 1,
+  gracePeriodDays: 5,
+  maxPayoutAmount: 50_000,
+};
+
+const CYCLE = { name: 'Cycle 2026', start: '2026-01-01', end: '2026-12-31' };
 
 /** Public Cloudinary demo image, used as the "receipt" for manual transfers. */
 const PROOF_IMAGE_URL = 'https://res.cloudinary.com/demo/image/upload/sample.jpg';
@@ -349,6 +386,8 @@ export interface DetailedGroupPlan {
   disbursements: Prisma.LoanDisbursementCreateManyInput[];
   fines: Prisma.FineCreateManyInput[];
   allocations: Prisma.DepositAllocationCreateManyInput[];
+  expenses: Prisma.ExpenseCreateManyInput[];
+  socialPayouts: Prisma.SocialPayoutCreateManyInput[];
   notifications: Prisma.UserNotificationCreateManyInput[];
   warnings: string[];
 }
@@ -1127,6 +1166,153 @@ export function planDetailedGroup(input: {
     }
   });
 
+  // ── social fund (ingoboka): 1,000 RWF on the 1st of every month, paid by MoMo ─────────
+  const socialDue: Date[] = [];
+  for (let m = 0; m < 24; m++) {
+    const d = new Date(Date.UTC(2026, m, SOCIAL_FUND.dayOfMonth, DUE_HOUR_UTC));
+    if (d > addDays(today, 31)) break;
+    socialDue.push(d);
+  }
+  for (const person of DETAILED_PEOPLE) {
+    const userId = uid(person.key);
+    socialDue.forEach((due, i) => {
+      const rowId = randomUUID();
+      const isFuture = due > today;
+      const behind = person.stopsPayingLastWeeks != null && i >= socialDue.filter((d) => d <= today).length - 1;
+      const paidAt = addHours(due, randInt(1, 72));
+      const paid = !isFuture && !behind && paidAt <= today;
+      if (paid) {
+        const depositId = randomUUID();
+        deposits.push({
+          id: depositId,
+          userId,
+          groupId,
+          amount: money(SOCIAL_FUND.amount),
+          currency: CURRENCY,
+          contributionPortion: money(SOCIAL_FUND.amount),
+          finePortion: money(0),
+          installmentPortion: money(0),
+          paymentMethod: DepositPaymentMethod.MTN_MOMO,
+          phone: person.phone,
+          status: DepositRecordStatus.CONFIRMED,
+          reviewedAt: paidAt,
+          createdAt: paidAt,
+          externalReference: randomUUID(),
+          providerStatus: 'SUCCESSFUL',
+        });
+        allocations.push({
+          depositId,
+          kind: AllocationKind.CONTRIBUTION,
+          amount: money(SOCIAL_FUND.amount),
+          contributionId: rowId,
+          createdAt: paidAt,
+        });
+      }
+      const late = !paid && !isFuture && today > addDays(due, SOCIAL_FUND.gracePeriodDays);
+      contributions.push({
+        id: rowId,
+        userId,
+        groupId,
+        fund: FundType.SOCIAL,
+        amount: money(SOCIAL_FUND.amount),
+        amountPaid: money(paid ? SOCIAL_FUND.amount : 0),
+        dueDate: due,
+        paidAt: paid ? paidAt : null,
+        status: paid ? ContributionStatus.PAID : late ? ContributionStatus.LATE : ContributionStatus.PENDING,
+        lateMarkedAt: late ? addDays(due, SOCIAL_FUND.gracePeriodDays) : null,
+        createdAt: addDays(due, -31),
+      });
+    });
+  }
+
+  // ── social payouts ───────────────────────────────────────────────────────
+  const socialPayouts: Prisma.SocialPayoutCreateManyInput[] = [];
+  const funeralAt = atUtc('2026-08-12', 10);
+  if (funeralAt <= today) {
+    socialPayouts.push({
+      id: randomUUID(),
+      groupId,
+      beneficiaryUserId: uid('m12'),
+      amount: money(30_000),
+      reason: SocialPayoutReason.FUNERAL,
+      description: 'Support for the funeral of her father in Huye.',
+      status: SocialPayoutStatus.PAID,
+      requestedById: uid('m12'),
+      approvedById: adminId,
+      approvedAt: addHours(funeralAt, 3),
+      paidById: treasurerId,
+      paidAt: addHours(funeralAt, 6),
+      method: 'MTN_MOMO',
+      reference: 'MP260812.1532.A41207',
+      createdAt: funeralAt,
+    });
+    note(uid('m12'), NotificationAudience.MEMBER, NotificationType.SOCIAL_PAYOUT_PAID, 'Social fund payout paid',
+      `30000 RWF from the ${g} social fund was paid to you (MTN_MOMO).`, addHours(funeralAt, 6), { groupName: g });
+  }
+  const sickAt = addHours(today, -30);
+  socialPayouts.push({
+    id: randomUUID(),
+    groupId,
+    beneficiaryUserId: uid('m05'),
+    amount: money(15_000),
+    reason: SocialPayoutReason.SICKNESS,
+    description: 'Hospital bill at King Faisal after an emergency operation.',
+    status: SocialPayoutStatus.PENDING,
+    requestedById: uid('m05'),
+    createdAt: sickAt,
+  });
+  noteLeaders(uid('m05'), NotificationType.SOCIAL_PAYOUT_REQUESTED, 'Social fund payout requested',
+    `Emmanuel Nshimiyimana: 15000 RWF (sickness) in ${g}.`, sickAt, { groupName: g });
+
+  // ── group expenses ───────────────────────────────────────────────────────
+  const expenses: Prisma.ExpenseCreateManyInput[] = [];
+  const expense = (
+    ymd: string,
+    amount: number,
+    category: ExpenseCategory,
+    description: string,
+    status: ExpenseStatus,
+    extra: Partial<Prisma.ExpenseCreateManyInput> = {},
+  ) => {
+    const at = atUtc(ymd, 12);
+    if (at > today) return;
+    expenses.push({
+      id: randomUUID(),
+      groupId,
+      amount: money(amount),
+      category,
+      description,
+      status,
+      requestedById: treasurerId,
+      occurredAt: at,
+      createdAt: at,
+      ...(status === ExpenseStatus.APPROVED ? { approvedById: adminId, approvedAt: addHours(at, 5) } : {}),
+      ...extra,
+    });
+  };
+  for (let m = 1; m <= 11; m++) {
+    const ymd = `2026-${String(m).padStart(2, '0')}-28`;
+    expense(ymd, 1_500, ExpenseCategory.BANK_FEES, 'Monthly account maintenance fee (Umwalimu SACCO)', ExpenseStatus.APPROVED);
+  }
+  expense('2026-01-09', 6_000, ExpenseCategory.STATIONERY, 'Cash book, receipt book and pens', ExpenseStatus.APPROVED);
+  expense('2026-06-26', 18_000, ExpenseCategory.MEETING, 'Mid-year general assembly: drinks and snacks', ExpenseStatus.APPROVED);
+  expense('2026-09-04', 4_000, ExpenseCategory.COMMUNICATION, 'Airtime for reminder calls', ExpenseStatus.REJECTED, {
+    rejectedById: adminId,
+    rejectionReason: 'Members agreed reminders go through the app now.',
+  });
+  const pendingExpenseAt = addHours(today, -20);
+  expenses.push({
+    id: randomUUID(),
+    groupId,
+    amount: money(8_000),
+    category: ExpenseCategory.TRANSPORT,
+    description: 'Transport to the district office for the cooperative certificate',
+    status: ExpenseStatus.PENDING,
+    requestedById: treasurerId,
+    occurredAt: pendingExpenseAt,
+    createdAt: pendingExpenseAt,
+  });
+
   return {
     contributions,
     deposits,
@@ -1135,6 +1321,8 @@ export function planDetailedGroup(input: {
     disbursements,
     fines,
     allocations,
+    expenses,
+    socialPayouts,
     notifications,
     warnings,
   };
@@ -1192,6 +1380,7 @@ export async function seedDetailedGroup(
         fullName: p.fullName,
         passwordHash: options.passwordHash,
         phoneNumber: p.phone,
+        phoneKey: p.phone.replace(/[^0-9]/g, ''),
         isActive: true,
         emailVerified: true,
         createdAt: addDays(atUtc(p.joinedOn), -1),
@@ -1204,6 +1393,28 @@ export async function seedDetailedGroup(
         emailVerified: true,
         emailVerificationOtpHash: null,
         emailVerificationExpiresAt: null,
+        // Re-seeding returns every account to a clean security state (msfts §6–§8).
+        phoneKey: p.phone.replace(/[^0-9]/g, ''),
+        phoneVerifiedAt: null,
+        phoneOtpHash: null,
+        phoneOtpExpiresAt: null,
+        phoneOtpPurpose: null,
+        otpFailedAttempts: 0,
+        passwordResetOtpHash: null,
+        passwordResetExpiresAt: null,
+        passwordChangedAt: null,
+        suspendedAt: null,
+        suspendedById: null,
+        suspensionReason: null,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        twoFactorMethod: null,
+        twoFactorEnabledAt: null,
+        totpSecretEnc: null,
+        totpPendingSecretEnc: null,
+        totpLastStep: null,
+        twoFactorRecoveryCodes: [],
+        image: null,
       },
     });
     await prisma.userPlatformRole.upsert({
@@ -1229,7 +1440,10 @@ export async function seedDetailedGroup(
       verificationRequestedAt: atUtc('2025-12-01', 10),
       verificationReviewedAt: atUtc('2025-12-02', 9),
       verificationDetails: { district: 'Gasabo', sector: 'Kimironko', cell: 'Bibare' },
-      minMembers: 30, // used as the member cap by the API
+      maxMembers: 30,
+      minMembers: 5,
+      defaultAbsenceFine: money(2_000),
+      defaultLateArrivalFine: money(500),
       createdById: userIds.admin,
       createdAt: atUtc('2025-12-01', 7),
     },
@@ -1264,7 +1478,36 @@ export async function seedDetailedGroup(
       penaltyPeriodDays: LOAN.penaltyPeriodDays,
       defaultAfterDays: LOAN.defaultAfterDays,
       blockIfArrears: LOAN.blockIfArrears,
+      installmentInterval: LOAN.installmentInterval,
+      interestMethod: LOAN.interestMethod,
+      earlyRepaymentRebatePercent: LOAN.earlyRepaymentRebatePercent,
+      allowTopUp: LOAN.allowTopUp,
       createdAt: atUtc('2025-12-01', 8),
+    },
+  });
+
+  await prisma.socialFundConfig.create({
+    data: {
+      groupId,
+      amount: money(SOCIAL_FUND.amount),
+      currency: CURRENCY,
+      interval: ContributionInterval.MONTHLY,
+      startDate: atUtc(`2026-01-0${SOCIAL_FUND.dayOfMonth}`),
+      dayOfMonth: SOCIAL_FUND.dayOfMonth,
+      gracePeriodDays: SOCIAL_FUND.gracePeriodDays,
+      maxPayoutAmount: money(SOCIAL_FUND.maxPayoutAmount),
+      createdAt: atUtc('2025-12-01', 8),
+    },
+  });
+
+  const cycle = await prisma.groupCycle.create({
+    data: {
+      groupId,
+      name: CYCLE.name,
+      startDate: new Date(`${CYCLE.start}T00:00:00.000Z`),
+      endDate: new Date(`${CYCLE.end}T23:59:59.999Z`),
+      notes: 'First cycle on E-kimina. Share-out at the December general assembly.',
+      createdAt: atUtc('2025-12-01', 9),
     },
   });
 
@@ -1283,15 +1526,274 @@ export async function seedDetailedGroup(
 
   await createManyChunked(plan.contributions, (data) => prisma.contribution.createMany({ data }));
   await createManyChunked(plan.applications, (data) => prisma.loanApplication.createMany({ data }));
+  const installments = scheduleSeedLoans(plan.loans, today);
   await createManyChunked(plan.loans, (data) => prisma.memberLoan.createMany({ data }));
+  await createManyChunked(installments, (data) => prisma.loanInstallment.createMany({ data }));
+  await prisma.loanApplication.updateMany({
+    where: { groupId },
+    data: { installmentIntervalSnapshot: LOAN.installmentInterval, interestMethodSnapshot: LOAN.interestMethod },
+  });
   await createManyChunked(plan.disbursements, (data) => prisma.loanDisbursement.createMany({ data }));
   await createManyChunked(plan.deposits, (data) => prisma.depositRecord.createMany({ data }));
   await createManyChunked(plan.fines, (data) => prisma.fine.createMany({ data }));
   await createManyChunked(plan.allocations, (data) => prisma.depositAllocation.createMany({ data }));
+  await createManyChunked(plan.expenses, (data) => prisma.expense.createMany({ data }));
+  await createManyChunked(plan.socialPayouts, (data) => prisma.socialPayout.createMany({ data }));
+
+  // Tag everything that falls inside the cycle, then rebuild the cash book from the records.
+  const inCycle = { gte: cycle.startDate, lte: cycle.endDate };
+  await prisma.contribution.updateMany({ where: { groupId, dueDate: inCycle }, data: { cycleId: cycle.id } });
+  await prisma.fine.updateMany({ where: { groupId, createdAt: inCycle }, data: { cycleId: cycle.id } });
+  await prisma.memberLoan.updateMany({ where: { groupId, disbursedAt: inCycle }, data: { cycleId: cycle.id } });
+  await prisma.expense.updateMany({ where: { groupId, occurredAt: inCycle }, data: { cycleId: cycle.id } });
+  await prisma.socialPayout.updateMany({ where: { groupId, createdAt: inCycle }, data: { cycleId: cycle.id } });
+  const ledgerRows = await backfillGroupLedger(prisma, groupId);
+  await seedGovernance(prisma, groupId, userIds, today, cycle.id);
   await createManyChunked(plan.notifications, (data) => prisma.userNotification.createMany({ data }));
 
-  if (log) printSummary(plan, today);
+  if (log) {
+    printSummary(plan, today);
+    console.log(`  ledger entries: ${ledgerRows}  (cycle "${CYCLE.name}")`);
+  }
   return { groupId };
+}
+
+/**
+ * Monthly installment schedules for the planned loans (msfts §4.1). Repayments fill the
+ * installments oldest first; penalties are recomputed per overdue installment exactly like the
+ * daily job, so the job adds nothing on its first run.
+ */
+function scheduleSeedLoans(loans: Prisma.MemberLoanCreateManyInput[], today: Date) {
+  const rows: Prisma.LoanInstallmentCreateManyInput[] = [];
+  for (const loan of loans) {
+    const disbursedAt = loan.disbursedAt as Date;
+    const sch = buildSchedule({
+      principal: Number(loan.principalAmount),
+      ratePercent: LOAN.interestRate,
+      termDays: LOAN.repaymentPeriodDays,
+      method: LOAN.interestMethod,
+      interval: LOAN.installmentInterval,
+      start: disbursedAt,
+    });
+    const states = sch.lines.map((l) => ({ ...l, amountPaid: 0 }));
+    const { out } = fillInstallments(states, Number(loan.amountRepaid));
+    for (const o of out) states.find((x) => x.number === o.number)!.amountPaid = o.newPaid;
+    let penalty = 0;
+    let maxPeriods = 0;
+    let oldestOverdue: Date | null = null;
+    const repaid = loan.status === MemberLoanStatus.REPAID;
+    for (const st of states) {
+      const remaining = round2(instTotal(st) - st.amountPaid);
+      const pen = repaid
+        ? { periodsDue: 0, add: 0 }
+        : installmentPenalty({
+            dueDate: st.dueDate,
+            remaining,
+            periodsApplied: 0,
+            ratePercent: LOAN.penaltyRate,
+            graceDays: LOAN.gracePeriodDays,
+            periodDays: LOAN.penaltyPeriodDays,
+            now: today,
+          });
+      if (pen.add > 0 && !oldestOverdue) oldestOverdue = addDays(st.dueDate, LOAN.gracePeriodDays);
+      penalty = round2(penalty + pen.add);
+      maxPeriods = Math.max(maxPeriods, pen.periodsDue);
+      const full = remaining < 0.005;
+      rows.push({
+        id: randomUUID(),
+        memberLoanId: loan.id!,
+        number: st.number,
+        dueDate: st.dueDate,
+        principal: money(st.principal),
+        interest: money(st.interest),
+        amountPaid: money(st.amountPaid),
+        status: full
+          ? InstallmentStatus.PAID
+          : st.dueDate < today
+            ? InstallmentStatus.LATE
+            : st.amountPaid > 0
+              ? InstallmentStatus.PARTIALLY_PAID
+              : InstallmentStatus.PENDING,
+        paidAt: full ? st.dueDate : null,
+        penaltyPeriodsApplied: pen.periodsDue,
+        lateMarkedAt: !full && st.dueDate < today ? addDays(st.dueDate, LOAN.gracePeriodDays) : null,
+        createdAt: disbursedAt,
+      });
+    }
+    loan.dueDate = sch.lines[sch.lines.length - 1].dueDate;
+    loan.installmentIntervalSnapshot = LOAN.installmentInterval;
+    loan.interestMethodSnapshot = LOAN.interestMethod;
+    loan.penaltyAccrued = money(penalty);
+    loan.penaltyPeriodsApplied = maxPeriods;
+    if (loan.status === MemberLoanStatus.DEFAULTED && oldestOverdue) {
+      const d = addDays(oldestOverdue, LOAN.defaultAfterDays);
+      loan.defaultedAt = d < today ? d : addHours(today, -1);
+    }
+  }
+  return rows;
+}
+
+/** Members & governance demo data (msfts §3). */
+async function seedGovernance(
+  prisma: PrismaClient,
+  groupId: string,
+  userIds: Record<string, string>,
+  today: Date,
+  cycleId: string,
+) {
+  const uid = (k: string) => userIds[k];
+  const allKeys = DETAILED_PEOPLE.map((p) => p.key);
+
+  // Constitution v1, accepted by everyone except the two newest regulars.
+  const constitution = await prisma.groupConstitution.create({
+    data: {
+      groupId,
+      version: 1,
+      title: 'Amategeko ya Twisungane Savings Group',
+      content: [
+        '1. Members save 5,000 RWF every Friday; payments after a 2-day grace period carry a 10% fine.',
+        '2. Members contribute 1,000 RWF to the social fund (ingoboka) on the 1st of every month.',
+        '3. Loans: up to 3× your savings, 5% flat interest, 90 days; the group admin and the treasurer both approve.',
+        '4. Late loans pay 2% of the balance per 30 days after a 7-day grace period; 120 days late = default.',
+        '5. Monthly meeting on the last Saturday; absence 2,000 RWF fine, late arrival 500 RWF.',
+        '6. Share-out at the December general assembly, in proportion to savings.',
+        '7. A member who leaves gets their savings back minus any debts; profit is shared only at share-out.',
+      ].join('\n'),
+      summaryOfChanges: 'First version adopted at the founding meeting.',
+      publishedById: uid('admin'),
+      createdAt: atUtc('2025-12-01', 10),
+    },
+  });
+  await prisma.constitutionAcceptance.createMany({
+    data: allKeys
+      .filter((k) => k !== 'm19' && k !== 'm20')
+      .map((k) => ({ constitutionId: constitution.id, userId: uid(k), acceptedAt: atUtc('2025-12-05', 12) })),
+  });
+
+  // Mid-year assembly (held, one absence fined) + the upcoming December assembly.
+  const held = await prisma.meeting.create({
+    data: {
+      groupId,
+      title: 'Mid-year general assembly',
+      scheduledAt: atUtc('2026-06-27', 7),
+      location: 'Kimironko sector hall',
+      agenda: 'Half-year accounts, loan policy review, social fund.',
+      status: MeetingStatus.HELD,
+      heldAt: atUtc('2026-06-27', 7),
+      minutesText:
+        'Accounts for January–June presented by the treasurer and approved. Members agreed to keep the loan multiplier at 3×. ' +
+        'Social fund payouts stay capped at 50,000 RWF.',
+      createdById: uid('admin'),
+      finesIssuedAt: atUtc('2026-06-27', 12),
+    },
+  });
+  const absenceFine = await prisma.fine.create({
+    data: {
+      groupId,
+      userId: uid('m11'),
+      type: FineTypeEnum.ABSENCE,
+      amount: money(2_000),
+      reason: 'Absent from “Mid-year general assembly” on 2026-06-27',
+      cycleId,
+      createdAt: atUtc('2026-06-27', 12),
+    },
+  });
+  await prisma.meetingAttendance.createMany({
+    data: allKeys.map((k) => ({
+      meetingId: held.id,
+      userId: uid(k),
+      status:
+        k === 'm11' ? AttendanceStatus.ABSENT : k === 'm15' ? AttendanceStatus.EXCUSED : AttendanceStatus.PRESENT,
+      note: k === 'm15' ? 'Travelling for work (informed the admin)' : null,
+      fineId: k === 'm11' ? absenceFine.id : null,
+      recordedById: uid('treasurer'),
+    })),
+  });
+  await prisma.meeting.create({
+    data: {
+      groupId,
+      title: 'End-of-year general assembly & share-out',
+      scheduledAt: atUtc('2026-12-19', 7),
+      location: 'Kimironko sector hall',
+      agenda: 'Cycle 2026 accounts, share-out, election of leaders for 2027, Cycle 2027 rules.',
+      createdById: uid('admin'),
+    },
+  });
+
+  // Votes: one closed, one open.
+  const closedPoll = await prisma.poll.create({
+    data: {
+      groupId,
+      title: 'Where should we hold the end-of-year assembly?',
+      kind: PollKind.GENERAL,
+      options: ['Kimironko sector hall', 'Treasurer’s compound', 'Restaurant in Remera'],
+      status: PollStatus.CLOSED,
+      closesAt: atUtc('2026-11-15', 18),
+      closedAt: atUtc('2026-11-15', 18),
+      createdById: uid('admin'),
+      createdAt: atUtc('2026-11-08', 9),
+    },
+  });
+  const choice = (i: number) => (i % 5 === 0 ? 2 : i % 4 === 0 ? 1 : 0);
+  await prisma.pollVote.createMany({
+    data: allKeys.slice(0, 18).map((k, i) => ({ pollId: closedPoll.id, userId: uid(k), optionIndex: choice(i) })),
+  });
+  const counts = [0, 1, 2].map((o) => allKeys.slice(0, 18).filter((_, i) => choice(i) === o).length);
+  await prisma.poll.update({
+    where: { id: closedPoll.id },
+    data: {
+      result: { eligible: 22, totalVotes: 18, turnoutPercent: 81.82, quorumMet: true, counts, passed: null, winner: 'Kimironko sector hall' },
+    },
+  });
+  const openPoll = await prisma.poll.create({
+    data: {
+      groupId,
+      title: 'Raise the weekly contribution to 6,000 RWF from Cycle 2027?',
+      description: 'Proposal from the treasurer to grow the loan fund. Applies from the first Friday of 2027 if passed.',
+      kind: PollKind.RULE_CHANGE,
+      options: ['Yes', 'No'],
+      closesAt: new Date(today.getTime() + 7 * DAY),
+      createdById: uid('treasurer'),
+      createdAt: new Date(today.getTime() - 2 * DAY),
+    },
+  });
+  await prisma.pollVote.createMany({
+    data: ['admin', 'treasurer', 'm01', 'm02', 'm03', 'm04', 'm05', 'm06', 'm11'].map((k) => ({
+      pollId: openPoll.id,
+      userId: uid(k),
+      optionIndex: k === 'm11' || k === 'm06' ? 1 : 0,
+    })),
+  });
+
+  // Member profiles (leaders + first ten members).
+  const kin = ['Wife', 'Husband', 'Mother', 'Brother', 'Sister', 'Son', 'Daughter'];
+  await prisma.groupMemberProfile.createMany({
+    data: allKeys.slice(0, 12).map((k, i) => ({
+      groupId,
+      userId: uid(k),
+      nationalId: `11985800${String(1000000 + i * 7919).slice(-7)}0`.slice(0, 16),
+      address: `Gasabo, Kimironko, KG ${120 + i} St`,
+      occupation: ['Teacher', 'Trader', 'Nurse', 'Mechanic', 'Farmer', 'Tailor'][i % 6],
+      nextOfKinName: `${kin[i % kin.length]} of ${DETAILED_PEOPLE[i].fullName.split(' ')[0]}`,
+      nextOfKinPhone: `+2507881${String(50000 + i).padStart(5, '0')}`,
+      nextOfKinRelationship: kin[i % kin.length],
+      beneficiaryName: `${kin[(i + 2) % kin.length]} of ${DETAILED_PEOPLE[i].fullName.split(' ')[0]}`,
+      beneficiaryPhone: `+2507882${String(50000 + i).padStart(5, '0')}`,
+      beneficiaryRelationship: kin[(i + 2) % kin.length],
+    })),
+  });
+
+  // A member asking to leave.
+  await prisma.exitRequest.create({
+    data: {
+      groupId,
+      userId: uid('m16'),
+      kind: ExitKind.VOLUNTARY,
+      reason: 'Moving to Musanze for a new job in January.',
+      requestedById: uid('m16'),
+      createdAt: new Date(today.getTime() - DAY),
+    },
+  });
 }
 
 /** Deletes the detailed group (cascades all its data). Optionally deletes its yopmail users too. */
@@ -1330,6 +1832,8 @@ Detailed group "${DETAILED_GROUP_NAME}" seeded (history up to ${today.toISOStrin
   member loans  : ${plan.loans.length}  (${fmt(countBy(plan.loans, (r) => String(r.status)))})
   fines         : ${plan.fines.length}  (${fmt(countBy(plan.fines, (r) => String(r.status)))})
   allocations   : ${plan.allocations.length}
+  expenses      : ${plan.expenses.length}  (${fmt(countBy(plan.expenses, (r) => String(r.status)))})
+  social payouts: ${plan.socialPayouts.length}  (${fmt(countBy(plan.socialPayouts, (r) => String(r.status)))})
   notifications : ${plan.notifications.length}
   Users (same password as the main seed):`);
   for (const p of DETAILED_PEOPLE) {

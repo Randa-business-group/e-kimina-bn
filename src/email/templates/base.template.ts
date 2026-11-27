@@ -53,7 +53,7 @@ export function renderTemplate(
 ): string {
   loadTemplates();
 
-  const appName = process.env.APP_NAME || 'Fasta';
+  const appName = process.env.APP_NAME || 'E-kimina';
   const logoUrl = process.env.APP_LOGO_URL || '';
   const logoHtml = logoUrl
     ? `<img src="${logoUrl}" alt="${appName}" class="logo-img" />`

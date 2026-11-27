@@ -148,7 +148,7 @@ export function validateEnv(config: EnvRecord) {
       };
 
   return {
-    APP_NAME: asString(config.APP_NAME, 'nest-app'),
+    APP_NAME: asString(config.APP_NAME, 'E-kimina API'),
     APP_VERSION: asString(config.APP_VERSION, '0.0.1'),
     NODE_ENV: nodeEnv,
     PORT: asPort(config.PORT, 4000),

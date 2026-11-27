@@ -6,6 +6,7 @@ import { PaymentsModule } from '../payments/payments.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { FinanceJobsService } from './finance-jobs.service';
 import { FinesService } from './fines.service';
+import { LoanExtrasService } from './loan-extras.service';
 import { GroupFinanceController } from './group-finance.controller';
 import { GroupFinanceService } from './group-finance.service';
 import { GroupLoansService } from './group-loans.service';
@@ -32,6 +33,7 @@ import {
     GroupLoansService,
     FinesService,
     FinanceJobsService,
+    LoanExtrasService,
   ],
   exports: [
     GroupFinanceService,

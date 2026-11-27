@@ -1,12 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
+  InstallmentStatus,
   LoanDisbursementStatus,
   MemberLoanStatus,
   NotificationType,
 } from '@prisma/client';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { DAY_MS, EPS, addDays, dec, decN, roundMoney } from './money.util';
+import { installmentPenalty } from './loan-schedule';
+import { EPS, addDays, dec, decN, roundMoney } from './money.util';
 import { loanBalances } from './payment-allocation.service';
 
 export interface LoanJobResult {
@@ -14,14 +16,20 @@ export interface LoanJobResult {
   penaltiesApplied: number;
   penaltyTotal: number;
   loansDefaulted: number;
+  installmentsMarkedLate: number;
+  remindersSent: number;
 }
 
+const REMINDER_DAYS = 3;
+
 /**
- * Overdue loans (daily):
- *  - penalty: `penaltyRate`% of the outstanding balance (principal + interest still unpaid)
- *    once per started `penaltyPeriodDays` after dueDate + gracePeriodDays. Idempotent via
- *    `penaltyPeriodsApplied`.
- *  - default: ACTIVE → DEFAULTED once `defaultAfterDays` have passed after dueDate + grace.
+ * Overdue loans (daily), per installment (msfts §4.1):
+ *  - an installment past dueDate + grace turns LATE;
+ *  - penalty: `penaltyRate`% of what is unpaid on each overdue installment, once per started
+ *    `penaltyPeriodDays` (idempotent via `penaltyPeriodsApplied`), added to the loan's penalty;
+ *  - default: ACTIVE → DEFAULTED `defaultAfterDays` after the oldest overdue installment's
+ *    dueDate + grace;
+ *  - reminder 3 days before each installment is due.
  * Loans whose payout is not completed are skipped.
  */
 @Injectable()
@@ -41,7 +49,6 @@ export class LoanPenaltyService {
       where: {
         ...(groupId ? { groupId } : {}),
         status: { in: [MemberLoanStatus.ACTIVE, MemberLoanStatus.DEFAULTED] },
-        dueDate: { lt: now },
         group: { deletedAt: null },
         OR: [
           { disbursement: { is: null } },
@@ -53,6 +60,7 @@ export class LoanPenaltyService {
       include: {
         group: { select: { name: true, loanConfig: true } },
         user: { select: { fullName: true } },
+        installments: { orderBy: { number: 'asc' } },
       },
     });
 
@@ -61,6 +69,8 @@ export class LoanPenaltyService {
       penaltiesApplied: 0,
       penaltyTotal: 0,
       loansDefaulted: 0,
+      installmentsMarkedLate: 0,
+      remindersSent: 0,
     };
 
     for (const loan of loans) {
@@ -68,45 +78,99 @@ export class LoanPenaltyService {
         const cfg = loan.group.loanConfig;
         const grace = cfg?.gracePeriodDays ?? 0;
         const periodDays = Math.max(1, cfg?.penaltyPeriodDays ?? 30);
-        const start = addDays(loan.dueDate, grace);
-        if (now <= start) continue;
-        const { balance, outstanding } = loanBalances(loan);
-        if (outstanding < EPS) continue;
-
         const rate = cfg?.penaltyRate != null ? decN(cfg.penaltyRate) : 0;
-        const periodsDue =
-          Math.floor(
-            (now.getTime() - start.getTime()) / (periodDays * DAY_MS),
-          ) + 1;
-        const newPeriods = periodsDue - loan.penaltyPeriodsApplied;
+        if (loanBalances(loan).outstanding < EPS) continue;
+
         let added = 0;
-        if (rate > 0 && newPeriods > 0 && balance > EPS) {
-          added = roundMoney(balance * (rate / 100) * newPeriods);
+        let newlyLate = 0;
+        let oldestOverdueStart: Date | null = null;
+        let maxPeriods = 0;
+        for (const inst of loan.installments) {
+          const remaining = roundMoney(
+            decN(inst.principal) + decN(inst.interest) - decN(inst.amountPaid),
+          );
+          if (remaining < EPS) continue;
+          const graceEnd = addDays(inst.dueDate, grace);
+          if (now > graceEnd) {
+            oldestOverdueStart ??= graceEnd;
+            const pen = installmentPenalty({
+              dueDate: inst.dueDate,
+              remaining,
+              periodsApplied: inst.penaltyPeriodsApplied,
+              ratePercent: rate,
+              graceDays: grace,
+              periodDays,
+              now,
+            });
+            const becameLate = inst.status !== InstallmentStatus.LATE;
+            if (pen.periodsDue !== inst.penaltyPeriodsApplied || becameLate) {
+              await this.prisma.loanInstallment.update({
+                where: { id: inst.id },
+                data: {
+                  penaltyPeriodsApplied: pen.periodsDue,
+                  ...(becameLate
+                    ? { status: InstallmentStatus.LATE, lateMarkedAt: now }
+                    : {}),
+                },
+              });
+            }
+            if (becameLate) newlyLate++;
+            maxPeriods = Math.max(maxPeriods, pen.periodsDue);
+            added = roundMoney(added + pen.add);
+          } else if (
+            !inst.reminderSentAt &&
+            inst.dueDate > now &&
+            inst.dueDate <= addDays(now, REMINDER_DAYS)
+          ) {
+            await this.prisma.loanInstallment.update({
+              where: { id: inst.id },
+              data: { reminderSentAt: now },
+            });
+            result.remindersSent++;
+            void this.notifications
+              .notifyMember({
+                userId: loan.userId,
+                groupId: loan.groupId,
+                type: NotificationType.LOAN_INSTALLMENT_DUE,
+                title: 'Loan installment due soon',
+                body: `Installment ${inst.number} of your loan in ${loan.group.name} (${remaining.toFixed(0)} ${loan.currency}) is due on ${inst.dueDate.toISOString().slice(0, 10)}.`,
+                metadata: {
+                  groupName: loan.group.name,
+                  memberLoanId: loan.id,
+                  installment: inst.number,
+                },
+              })
+              .catch((e) => this.logger.error(e));
+          }
         }
+        result.installmentsMarkedLate += newlyLate;
 
         const shouldDefault =
           loan.status === MemberLoanStatus.ACTIVE &&
           cfg?.defaultAfterDays != null &&
-          now.getTime() >= addDays(start, cfg.defaultAfterDays).getTime();
+          oldestOverdueStart != null &&
+          now.getTime() >=
+            addDays(oldestOverdueStart, cfg.defaultAfterDays).getTime();
 
-        if (added < EPS && newPeriods <= 0 && !shouldDefault) continue;
+        if (added > EPS || shouldDefault) {
+          await this.prisma.memberLoan.update({
+            where: { id: loan.id },
+            data: {
+              ...(added > EPS
+                ? {
+                    penaltyAccrued: dec(decN(loan.penaltyAccrued) + added),
+                    lastPenaltyAt: now,
+                    penaltyPeriodsApplied: maxPeriods,
+                  }
+                : {}),
+              ...(shouldDefault
+                ? { status: MemberLoanStatus.DEFAULTED, defaultedAt: now }
+                : {}),
+            },
+          });
+        }
 
-        await this.prisma.memberLoan.update({
-          where: { id: loan.id },
-          data: {
-            ...(newPeriods > 0 ? { penaltyPeriodsApplied: periodsDue } : {}),
-            ...(added > EPS
-              ? {
-                  penaltyAccrued: dec(decN(loan.penaltyAccrued) + added),
-                  lastPenaltyAt: now,
-                }
-              : {}),
-            ...(shouldDefault
-              ? { status: MemberLoanStatus.DEFAULTED, defaultedAt: now }
-              : {}),
-          },
-        });
-
+        const outstanding = roundMoney(loanBalances(loan).outstanding + added);
         if (added > EPS) {
           result.penaltiesApplied += 1;
           result.penaltyTotal = roundMoney(result.penaltyTotal + added);
@@ -116,12 +180,23 @@ export class LoanPenaltyService {
               groupId: loan.groupId,
               type: NotificationType.LOAN_PENALTY_APPLIED,
               title: 'Loan overdue — penalty added',
-              body: `Your loan in ${loan.group.name} is overdue. A penalty of ${added.toFixed(0)} ${loan.currency} was added. Outstanding: ${(outstanding + added).toFixed(0)} ${loan.currency}.`,
+              body: `Your loan in ${loan.group.name} has overdue installments. A penalty of ${added.toFixed(0)} ${loan.currency} was added. Outstanding: ${outstanding.toFixed(0)} ${loan.currency}.`,
               metadata: {
                 groupName: loan.group.name,
                 memberLoanId: loan.id,
                 penalty: added,
               },
+            })
+            .catch((e) => this.logger.error(e));
+        } else if (newlyLate > 0) {
+          void this.notifications
+            .notifyMember({
+              userId: loan.userId,
+              groupId: loan.groupId,
+              type: NotificationType.LOAN_INSTALLMENT_LATE,
+              title: 'Loan installment overdue',
+              body: `${newlyLate} installment${newlyLate > 1 ? 's' : ''} of your loan in ${loan.group.name} ${newlyLate > 1 ? 'are' : 'is'} overdue.`,
+              metadata: { groupName: loan.group.name, memberLoanId: loan.id },
             })
             .catch((e) => this.logger.error(e));
         }
@@ -142,7 +217,7 @@ export class LoanPenaltyService {
               groupId: loan.groupId,
               type: NotificationType.LOAN_DEFAULTED,
               title: 'Loan defaulted',
-              body: `${loan.user.fullName}'s loan in ${loan.group.name} is now in default (${(outstanding + added).toFixed(0)} ${loan.currency} outstanding).`,
+              body: `${loan.user.fullName}'s loan in ${loan.group.name} is now in default (${outstanding.toFixed(0)} ${loan.currency} outstanding). Guarantees can be called.`,
               metadata: { groupName: loan.group.name, memberLoanId: loan.id },
             })
             .catch((e) => this.logger.error(e));

@@ -1,0 +1,80 @@
+# API checks on every push and pull request (msfts §10).
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ekimina
+          POSTGRES_PASSWORD: ekimina
+          POSTGRES_DB: ekimina_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ekimina"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ekimina:ekimina@localhost:5432/ekimina_ci?schema=public
+      JWT_SECRET: ci-only-secret-not-for-production-0123456789
+      NODE_ENV: test
+      SMS_PROVIDER: mock
+      MOMO_MODE: mock
+      SMTP_HOST: ""
+      FINANCE_JOBS_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Lint
+        run: pnpm exec eslint "src/**/*.ts" "test/**/*.ts"
+
+      - name: Type-check
+        run: |
+          pnpm exec tsc --noEmit -p tsconfig.json
+          pnpm exec tsc --noEmit -p prisma/tsconfig.json
+
+      - name: Unit tests
+        run: pnpm exec jest --ci
+
+      - name: Apply migrations to an empty database
+        run: pnpm exec prisma migrate deploy
+
+      - name: Migrations match the schema (drift check)
+        run: pnpm exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      - name: Seed
+        run: pnpm exec prisma db seed
+
+      - name: End-to-end money flow
+        run: pnpm run test:e2e
+
+      - name: Build
+        run: pnpm run build

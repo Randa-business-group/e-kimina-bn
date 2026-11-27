@@ -34,11 +34,21 @@ export class CreateGroupDto {
 
   @ApiProperty({
     example: 50,
-    description: 'Maximum members allowed in this group (not stored count).',
+    description: 'Maximum members allowed in this group (member cap).',
   })
   @IsInt()
   @Min(2)
-  minMembers!: number;
+  maxMembers!: number;
+
+  @ApiPropertyOptional({
+    example: 5,
+    description:
+      'Active members needed before the group can ask for verification (default 2).',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  minMembers?: number;
 
   @ApiPropertyOptional({
     example: 'treasurer@example.com',

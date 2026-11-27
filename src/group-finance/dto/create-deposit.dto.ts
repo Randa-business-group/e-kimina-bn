@@ -64,6 +64,14 @@ export class CreateDepositDto {
 
   @ApiPropertyOptional({
     description:
+      'With memberLoanId: pay the early-payoff amount (loan-repayment-preview.earlyPayoff.amount); the rebate is granted when it clears the loan.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  earlyPayoff?: boolean;
+
+  @ApiPropertyOptional({
+    description:
       'Client-generated key (e.g. UUID). Retrying with the same key returns the same deposit.',
   })
   @IsOptional()

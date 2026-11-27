@@ -13,7 +13,10 @@ import {
   DepositRecord,
   DepositRecordStatus,
   FineStatus,
+  FundType,
+  GuarantorStatus,
   GroupMembershipStatus,
+  LoanApplication,
   LoanApplicationStatus,
   MemberLoanStatus,
   NotificationType,
@@ -22,7 +25,15 @@ import {
 } from '@prisma/client';
 import { EmailService } from '../email/email.service.js';
 import { GroupCashService } from '../finance-core/group-cash.service';
-import { EPS, dec, decN, roundMoney } from '../finance-core/money.util';
+import { scheduleSnapshot } from '../finance-core/loan-installments';
+import { loanBlockers, loanCap } from '../finance-core/loan-eligibility';
+import {
+  EPS,
+  dec,
+  decN,
+  groupCurrency,
+  roundMoney,
+} from '../finance-core/money.util';
 import {
   OPEN_LOAN_STATUSES,
   PaymentAllocationService,
@@ -32,6 +43,8 @@ import {
 import { NotificationsService } from '../notifications/notifications.service';
 import { MomoService, type MomoStatusResult } from '../payments/momo.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentAccountsService } from '../platform/payment-accounts.service';
+import { PlatformSettingsService } from '../platform/platform-settings.service';
 import { GroupLoansService } from './group-loans.service';
 
 export interface CreateDepositInput {
@@ -42,6 +55,8 @@ export interface CreateDepositInput {
   memberLoanId?: string;
   /** Pay the open loan together with contributions / fines in one deposit. */
   includeLoanRepayment?: boolean;
+  /** Loan repayment for the early-payoff amount (rebate applied when it clears the loan). */
+  earlyPayoff?: boolean;
   idempotencyKey?: string;
 }
 
@@ -57,6 +72,8 @@ export class GroupFinanceService {
     private readonly allocation: PaymentAllocationService,
     private readonly cash: GroupCashService,
     private readonly momo: MomoService,
+    private readonly platform: PlatformSettingsService,
+    private readonly paymentAccounts: PaymentAccountsService,
   ) {}
 
   // ── access helpers ──────────────────────────────────────────────────────
@@ -169,10 +186,11 @@ export class GroupFinanceService {
     }
 
     const open = await this.allocation.getOpenObligations(groupId, userId);
-    let contribution = open.contributionTotal;
+    let contribution = open.savingsTotal;
+    const socialContribution = open.socialTotal;
     const fine = open.fineTotal;
     let isAdvancePayment = false;
-    if (contribution + fine < EPS) {
+    if (open.contributionTotal + fine < EPS) {
       // Everything is paid: offer the next period in advance.
       const m = await this.prisma.userGroup.findUnique({
         where: { userId_groupId: { userId, groupId } },
@@ -188,17 +206,43 @@ export class GroupFinanceService {
 
     const loan = await this.allocation.getPayableLoan(groupId, userId);
     const lb = loan ? loanBalances(loan) : null;
-    const installment = opts.includeLoan && lb ? lb.outstanding : 0;
+    const lc = loan
+      ? await this.prisma.loanConfig.findUnique({ where: { groupId } })
+      : null;
+    const snap = loan
+      ? await scheduleSnapshot(
+          this.prisma,
+          loan,
+          new Date(),
+          lc?.earlyRepaymentRebatePercent ?? 0,
+        )
+      : null;
+    // "Also repay my loan" pays what is due now (penalty + overdue + next installment).
+    const loanDueNow = lb && snap ? Math.min(lb.outstanding, snap.dueNow) : 0;
+    const installment = opts.includeLoan && lb ? loanDueNow : 0;
     const now = new Date();
 
+    const previewTotal = roundMoney(
+      contribution + socialContribution + fine + installment,
+    );
+    const [momoFee, manualTransferAccount] = await Promise.all([
+      this.platform.feeFor(previewTotal),
+      this.paymentAccounts.manualTransferAccount(groupId),
+    ]);
     return {
       configured: true as const,
       currency: cc.currency ?? 'RWF',
+      /** Platform fee added on top when paying this total with MTN MoMo (msfts §6). */
+      momoFee,
+      /** Where to send a manual transfer (the group's account, else the platform's). */
+      manualTransferAccount,
       allowPartialPayments: cc.allowPartialPayments,
       contribution: roundMoney(contribution),
+      /** Social fund (ingoboka) periods due; included in total. */
+      socialContribution: socialContribution,
       fine: roundMoney(fine),
       installment: roundMoney(installment),
-      total: roundMoney(contribution + fine + installment),
+      total: roundMoney(contribution + socialContribution + fine + installment),
       isAdvancePayment,
       overdueContributions: open.rows.filter(
         (r) => r.row.status === ContributionStatus.LATE,
@@ -210,6 +254,7 @@ export class GroupFinanceService {
         amountPaid: decN(r.row.amountPaid),
         remaining: r.remaining,
         status: r.row.status,
+        fund: r.row.fund,
       })),
       openFines: open.fines.map((f) => ({
         id: f.fine.id,
@@ -228,6 +273,8 @@ export class GroupFinanceService {
               penalty: lb.penalty,
               balance: lb.balance,
               outstanding: lb.outstanding,
+              dueNow: loanDueNow,
+              nextInstallment: snap?.nextInstallment ?? null,
               included: Boolean(opts.includeLoan),
             }
           : null,
@@ -237,6 +284,35 @@ export class GroupFinanceService {
   // ── create deposit ──────────────────────────────────────────────────────
 
   async createDeposit(
+    userId: string,
+    groupId: string,
+    dto: CreateDepositInput,
+  ) {
+    try {
+      return await this.createDepositOnce(userId, groupId, dto);
+    } catch (e) {
+      // A double click raced past the key check: answer with the deposit that won.
+      const key = dto.idempotencyKey?.trim();
+      if (
+        key &&
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        e.code === 'P2002'
+      ) {
+        const existing = await this.prisma.depositRecord.findUnique({
+          where: { idempotencyKey: key },
+        });
+        if (existing && existing.userId === userId) {
+          return this.depositResponse(
+            existing,
+            'This payment was already submitted.',
+          );
+        }
+      }
+      throw e;
+    }
+  }
+
+  private async createDepositOnce(
     userId: string,
     groupId: string,
     dto: CreateDepositInput,
@@ -301,6 +377,19 @@ export class GroupFinanceService {
       }
       purpose = DepositPurpose.LOAN_REPAYMENT;
       total = lp.total;
+      if (dto.earlyPayoff) {
+        if (!lp.earlyPayoff) {
+          throw new BadRequestException(
+            'No early-payoff rebate is available for this loan.',
+          );
+        }
+        total = lp.earlyPayoff.amount;
+        if (Math.abs(dto.amount - total) > 0.01) {
+          throw new BadRequestException(
+            `The early payoff amount is ${total.toFixed(2)} ${lp.currency}.`,
+          );
+        }
+      }
       allowPartial = lp.allowPartialPayments;
       currency = lp.currency;
       split = {
@@ -329,7 +418,7 @@ export class GroupFinanceService {
       allowPartial = p.allowPartialPayments;
       currency = p.currency;
       split = {
-        contribution: p.contribution,
+        contribution: p.contribution + p.socialContribution,
         fine: p.fine,
         installment: p.installment,
       };
@@ -370,6 +459,8 @@ export class GroupFinanceService {
         ),
       ),
       idempotencyKey: idemKey,
+      earlyPayoff:
+        purpose === DepositPurpose.LOAN_REPAYMENT && dto.earlyPayoff === true,
     };
 
     if (dto.paymentMethod === DepositPaymentMethod.MTN_MOMO) {
@@ -398,6 +489,8 @@ export class GroupFinanceService {
       id: d.id,
       message,
       amount: decN(d.amount),
+      /** Platform fee charged on top (MoMo only). */
+      platformFee: decN(d.platformFee),
       currency: d.currency,
       status: d.status,
       purpose: d.purpose,
@@ -470,12 +563,16 @@ export class GroupFinanceService {
     >,
     phone: string,
   ) {
-    if (!this.momo.isEnabled('collection')) {
+    if (!(await this.momo.isEnabledFor('collection', group.id))) {
       throw new BadRequestException(
         'MTN MoMo payments are not available for now. Please use a manual transfer.',
       );
     }
     const msisdn = this.momo.normalizeMsisdn(phone);
+    // Platform fee (msfts §6) is charged on top and never enters the group's books.
+    const platformFee = await this.platform.feeFor(
+      decN(base.amount as Prisma.Decimal | number | string),
+    );
     const referenceId = randomUUID();
     const created = await this.prisma.depositRecord.create({
       data: {
@@ -485,13 +582,15 @@ export class GroupFinanceService {
         status: DepositRecordStatus.PENDING,
         externalReference: referenceId,
         providerStatus: 'CREATED',
+        platformFee,
       },
     });
 
     try {
       await this.momo.requestToPay({
         referenceId,
-        amount: decN(created.amount),
+        groupId: group.id,
+        amount: decN(created.amount) + platformFee,
         externalId: created.id,
         msisdn,
         payerMessage: `E-kimina: ${group.name}`,
@@ -548,7 +647,10 @@ export class GroupFinanceService {
     }
     let result: MomoStatusResult;
     try {
-      result = await this.momo.getRequestToPayStatus(d.externalReference);
+      result = await this.momo.getRequestToPayStatus(
+        d.externalReference,
+        d.groupId,
+      );
     } catch (e) {
       this.logger.warn(
         `MoMo status check failed for ${d.id}: ${e instanceof Error ? e.message : e}`,
@@ -661,7 +763,10 @@ export class GroupFinanceService {
   }
 
   /** Background poller: refresh MoMo deposits still waiting on the payer. */
-  async pollPendingMomoDeposits(): Promise<number> {
+  /** Pending MoMo deposits; `enqueue` hands each to the job queue instead of checking inline. */
+  async pollPendingMomoDeposits(
+    enqueue?: (depositId: string) => Promise<unknown>,
+  ): Promise<number> {
     const pending = await this.prisma.depositRecord.findMany({
       where: {
         status: DepositRecordStatus.PENDING,
@@ -674,7 +779,9 @@ export class GroupFinanceService {
       orderBy: { createdAt: 'asc' },
     });
     for (const p of pending) {
-      await this.refreshMomoDeposit(p.id).catch((e) => this.logger.error(e));
+      if (enqueue) await enqueue(p.id);
+      else
+        await this.refreshMomoDeposit(p.id).catch((e) => this.logger.error(e));
     }
     return pending.length;
   }
@@ -1052,7 +1159,11 @@ export class GroupFinanceService {
 
   // ── loan eligibility ────────────────────────────────────────────────────
 
-  async getLoanRequestPreview(userId: string, groupId: string) {
+  async getLoanRequestPreview(
+    userId: string,
+    groupId: string,
+    opts: { topUpOfLoanId?: string } = {},
+  ) {
     await this.requireActiveMemberInVerifiedGroup(userId, groupId);
     const loanConfig = await this.prisma.loanConfig.findUnique({
       where: { groupId },
@@ -1067,12 +1178,12 @@ export class GroupFinanceService {
     const [paid, openLoan, writtenOff, lateCount, fines, pendingApp, cashPos] =
       await Promise.all([
         this.prisma.contribution.aggregate({
-          where: { userId, groupId },
+          // Loan stake = savings only (the social fund is not lendable).
+          where: { userId, groupId, fund: FundType.SAVINGS },
           _sum: { amountPaid: true },
         }),
         this.prisma.memberLoan.findFirst({
           where: { userId, groupId, status: { in: OPEN_LOAN_STATUSES } },
-          select: { id: true },
         }),
         this.prisma.memberLoan.count({
           where: { userId, groupId, status: MemberLoanStatus.WRITTEN_OFF },
@@ -1092,90 +1203,150 @@ export class GroupFinanceService {
       ]);
 
     const totalContributed = roundMoney(decN(paid._sum.amountPaid));
+    // Savings promised as a guarantee for someone else's loan are not available as stake.
+    const lockedByGuarantees = await this.lockedGuarantees(userId, groupId);
+    const stake = roundMoney(
+      Math.max(0, totalContributed - lockedByGuarantees),
+    );
+    const topUp =
+      opts.topUpOfLoanId && openLoan && openLoan.id === opts.topUpOfLoanId
+        ? openLoan
+        : null;
+    const topUpBalance = topUp ? loanBalances(topUp).outstanding : 0;
     const openFines = roundMoney(
       fines.reduce((s, f) => s + decN(f.amount) - decN(f.amountPaid), 0),
     );
-    const allowExceed = loanConfig.allowExceedContribution;
-    const mult = loanConfig.maxLoanMultiplier;
+    const currency = await groupCurrency(this.prisma, groupId);
+    const { stakeCap, maxAmount } = loanCap({
+      stake,
+      allowExceedContribution: loanConfig.allowExceedContribution,
+      multiplier:
+        loanConfig.maxLoanMultiplier != null
+          ? decN(loanConfig.maxLoanMultiplier)
+          : null,
+      cashAvailable: cashPos.available,
+      topUpBalance,
+    });
 
-    let stakeCap: number;
-    if (!allowExceed) stakeCap = totalContributed;
-    else if (mult != null) stakeCap = totalContributed * decN(mult);
-    else stakeCap = Number.POSITIVE_INFINITY;
-    const maxAmount = roundMoney(
-      Math.max(0, Math.min(stakeCap, cashPos.available)),
-    );
-
-    const blockers: string[] = [];
-    if (openLoan) {
-      blockers.push(
-        'You already have an unpaid loan in this group. Repay it before applying for another loan.',
-      );
+    const rules = await this.prisma.group.findUnique({
+      where: { id: groupId },
+      select: { constitutionRequired: true },
+    });
+    let constitutionNotAccepted: number | null = null;
+    if (rules?.constitutionRequired) {
+      const c = await this.prisma.groupConstitution.findFirst({
+        where: { groupId },
+        orderBy: { version: 'desc' },
+      });
+      const accepted =
+        !c ||
+        (await this.prisma.constitutionAcceptance.findUnique({
+          where: { constitutionId_userId: { constitutionId: c.id, userId } },
+        })) != null;
+      if (c && !accepted) constitutionNotAccepted = c.version;
     }
-    if (pendingApp) {
-      blockers.push(
-        'You already have a loan application waiting for approval.',
-      );
-    }
-    if (writtenOff > 0) {
-      blockers.push(
-        'A previous loan of yours was written off. Talk to your group leaders.',
-      );
-    }
-    if (loanConfig.blockIfArrears && (lateCount > 0 || openFines > EPS)) {
-      const parts: string[] = [];
-      if (lateCount > 0)
-        parts.push(`${lateCount} late contribution${lateCount > 1 ? 's' : ''}`);
-      if (openFines > EPS)
-        parts.push(`${openFines.toFixed(0)} RWF in unpaid fines`);
-      blockers.push(`Clear your arrears first (${parts.join(' and ')}).`);
-    }
-    if (cashPos.available < 1) {
-      blockers.push('The group has no cash available for loans right now.');
-    } else if (stakeCap > cashPos.available) {
-      // informative only; maxAmount already capped
-    }
-    if (blockers.length === 0 && maxAmount <= 0) {
-      blockers.push(
-        'You are not eligible yet (max amount is 0). Contribute first.',
-      );
-    }
+    const blockers = loanBlockers({
+      topUpRequested: Boolean(opts.topUpOfLoanId),
+      allowTopUp: loanConfig.allowTopUp,
+      topUpMatches: Boolean(topUp),
+      topUpActive: topUp?.status === MemberLoanStatus.ACTIVE,
+      hasOpenLoan: Boolean(openLoan),
+      hasPendingApplication: Boolean(pendingApp),
+      writtenOffLoans: writtenOff,
+      blockIfArrears: loanConfig.blockIfArrears,
+      lateContributions: lateCount,
+      openFines,
+      cashAvailable: cashPos.available,
+      constitutionNotAccepted,
+      maxAmount,
+      currency,
+    });
 
     return {
       configured: true as const,
       canRequest: blockers.length === 0,
-      currency: 'RWF',
+      currency,
       minAmount: 0.01,
       maxAmount,
       totalContributed,
       stakeCap: Number.isFinite(stakeCap) ? roundMoney(stakeCap) : null,
+      lockedByGuarantees,
+      guarantorsRequired: loanConfig.guarantorsRequired,
+      interestMethod: loanConfig.interestMethod,
+      installmentInterval: loanConfig.installmentInterval,
+      allowTopUp: loanConfig.allowTopUp,
+      topUp: topUp
+        ? { memberLoanId: topUp.id, outstanding: topUpBalance }
+        : null,
       groupCashAvailable: cashPos.available,
       lateContributions: lateCount,
       openFines,
       interestRate: decN(loanConfig.interestRate),
       repaymentPeriodDays: loanConfig.repaymentPeriodDays,
-      allowExceedContribution: allowExceed,
+      allowExceedContribution: loanConfig.allowExceedContribution,
       blockers,
       ...(blockers.length > 0 ? { message: blockers[0] } : {}),
     };
   }
 
+  /** Savings a member has promised as guarantor (requested, accepted, or called and unpaid). */
+  async lockedGuarantees(userId: string, groupId: string) {
+    const rows = await this.prisma.loanGuarantor.findMany({
+      where: {
+        groupId,
+        guarantorUserId: userId,
+        status: {
+          in: [
+            GuarantorStatus.REQUESTED,
+            GuarantorStatus.ACCEPTED,
+            GuarantorStatus.CALLED,
+          ],
+        },
+      },
+    });
+    return roundMoney(
+      rows.reduce(
+        (a, g) =>
+          a +
+          (g.status === GuarantorStatus.CALLED
+            ? Math.max(0, decN(g.calledAmount) - decN(g.paidAmount))
+            : decN(g.amountGuaranteed)),
+        0,
+      ),
+    );
+  }
+
   async createLoanApplication(
     userId: string,
     groupId: string,
-    requestedAmount: number,
+    dto: {
+      requestedAmount: number;
+      purpose?: string;
+      attachmentUrls?: string[];
+      guarantors?: { userId: string; amount: number }[];
+      topUpOfLoanId?: string;
+      idempotencyKey?: string;
+    },
   ) {
-    const { membership } = await this.requireActiveMemberInVerifiedGroup(
-      userId,
-      groupId,
-    );
+    await this.requireActiveMemberInVerifiedGroup(userId, groupId);
+    const idemKey = dto.idempotencyKey?.trim() || null;
+    if (idemKey) {
+      const existing = await this.prisma.loanApplication.findUnique({
+        where: { idempotencyKey: idemKey },
+      });
+      if (existing)
+        return this.replayLoanApplication(existing, userId, groupId);
+    }
     const loanConfig = await this.prisma.loanConfig.findUnique({
       where: { groupId },
     });
     if (!loanConfig)
       throw new BadRequestException('Loan is not configured for this group.');
+    const requestedAmount = dto.requestedAmount;
 
-    const preview = await this.getLoanRequestPreview(userId, groupId);
+    const preview = await this.getLoanRequestPreview(userId, groupId, {
+      topUpOfLoanId: dto.topUpOfLoanId,
+    });
     if (!preview.configured) {
       throw new BadRequestException(
         'You cannot request a loan in this group yet.',
@@ -1191,36 +1362,107 @@ export class GroupFinanceService {
         `Requested amount must not exceed ${preview.maxAmount.toFixed(2)} RWF (your stake and the group's available cash).`,
       );
     }
+    if (preview.topUp && requestedAmount <= preview.topUp.outstanding + 0.01) {
+      throw new BadRequestException(
+        `A top-up must be larger than your current balance (${preview.topUp.outstanding.toFixed(0)} RWF).`,
+      );
+    }
 
-    const applicantRole = membership.role?.name;
-    const now = new Date();
-    const created = await this.prisma.loanApplication.create({
-      data: {
-        userId,
-        groupId,
-        requestedAmount: dec(requestedAmount),
-        status: LoanApplicationStatus.PENDING,
-        interestRateSnapshot: loanConfig.interestRate,
-        repaymentPeriodDaysSnapshot: loanConfig.repaymentPeriodDays,
-        maxAmountSnapshot: dec(preview.maxAmount),
-        ...(applicantRole === RoleName.GROUP_ADMIN
-          ? { groupAdminApprovedAt: now, groupAdminApprovedById: userId }
-          : {}),
-        ...(applicantRole === RoleName.TREASURER
-          ? { treasurerApprovedAt: now, treasurerApprovedById: userId }
-          : {}),
-      },
-    });
+    // Guarantors (msfts §4.2)
+    const guarantors = dto.guarantors ?? [];
+    if (guarantors.length < loanConfig.guarantorsRequired) {
+      throw new BadRequestException(
+        `This group requires ${loanConfig.guarantorsRequired} guarantor(s) for a loan.`,
+      );
+    }
+    const seen = new Set<string>();
+    for (const g of guarantors) {
+      if (g.userId === userId)
+        throw new BadRequestException('You cannot guarantee your own loan.');
+      if (seen.has(g.userId))
+        throw new BadRequestException('Each guarantor can be listed once.');
+      seen.add(g.userId);
+      const m = await this.prisma.userGroup.findFirst({
+        where: {
+          userId: g.userId,
+          groupId,
+          membershipStatus: GroupMembershipStatus.ACTIVE,
+        },
+        include: { user: { select: { fullName: true } } },
+      });
+      if (!m)
+        throw new BadRequestException(
+          'Every guarantor must be an active member of the group.',
+        );
+      const saved = await this.prisma.contribution.aggregate({
+        where: { userId: g.userId, groupId, fund: FundType.SAVINGS },
+        _sum: { amountPaid: true },
+      });
+      const capacity = roundMoney(
+        decN(saved._sum.amountPaid) -
+          (await this.lockedGuarantees(g.userId, groupId)),
+      );
+      if (g.amount - capacity > 0.01) {
+        throw new BadRequestException(
+          `${m.user.fullName} can guarantee at most ${Math.max(0, capacity).toFixed(0)} RWF.`,
+        );
+      }
+    }
+
+    const currency = await groupCurrency(this.prisma, groupId);
+    let created: LoanApplication;
+    try {
+      created = await this.prisma.loanApplication.create({
+        data: {
+          userId,
+          groupId,
+          idempotencyKey: idemKey,
+          currency,
+          requestedAmount: dec(requestedAmount),
+          status: LoanApplicationStatus.PENDING,
+          interestRateSnapshot: loanConfig.interestRate,
+          repaymentPeriodDaysSnapshot: loanConfig.repaymentPeriodDays,
+          interestMethodSnapshot: loanConfig.interestMethod,
+          installmentIntervalSnapshot: loanConfig.installmentInterval,
+          maxAmountSnapshot: dec(preview.maxAmount),
+          purpose: dto.purpose?.trim() || null,
+          attachmentUrls: dto.attachmentUrls?.length
+            ? dto.attachmentUrls
+            : undefined,
+          topUpOfLoanId: preview.topUp?.memberLoanId ?? null,
+          guarantors: {
+            create: guarantors.map((g) => ({
+              groupId,
+              guarantorUserId: g.userId,
+              amountGuaranteed: dec(g.amount),
+            })),
+          },
+        },
+      });
+    } catch (e) {
+      // Two clicks raced with the same key: return the one that won.
+      if (
+        idemKey &&
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        e.code === 'P2002'
+      ) {
+        const winner = await this.prisma.loanApplication.findUnique({
+          where: { idempotencyKey: idemKey },
+        });
+        if (winner) return this.replayLoanApplication(winner, userId, groupId);
+      }
+      throw e;
+    }
 
     const g = await this.prisma.group.findUnique({
       where: { id: groupId },
       select: { name: true },
     });
+    const member = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { fullName: true },
+    });
     if (g) {
-      const member = await this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { fullName: true },
-      });
       void this.notifications
         .notifyLoanApplicationSubmitted({
           groupId,
@@ -1231,6 +1473,18 @@ export class GroupFinanceService {
           amount: decN(created.requestedAmount).toFixed(0),
         })
         .catch((e) => this.logger.error(e));
+      for (const gu of guarantors) {
+        void this.notifications
+          .notifyMember({
+            userId: gu.userId,
+            groupId,
+            type: NotificationType.GUARANTOR_REQUESTED,
+            title: 'Guarantee requested',
+            body: `${member?.fullName ?? 'A member'} asks you to guarantee ${gu.amount.toFixed(0)} ${currency} of a ${requestedAmount.toFixed(0)} ${currency} loan in ${g.name}.`,
+            metadata: { groupName: g.name, applicationId: created.id },
+          })
+          .catch((e) => this.logger.error(e));
+      }
     }
 
     return {
@@ -1238,11 +1492,27 @@ export class GroupFinanceService {
       status: created.status,
       requestedAmount: decN(created.requestedAmount),
       message:
-        applicantRole === RoleName.GROUP_ADMIN
-          ? 'Your loan request was submitted. Group admin approval was auto-recorded, and treasurer approval is still required before disbursement.'
-          : applicantRole === RoleName.TREASURER
-            ? 'Your loan request was submitted. Treasurer approval was auto-recorded, and group admin approval is still required before disbursement.'
-            : 'Your loan request was submitted. Both the group admin and the treasurer must approve before it is disbursed.',
+        'Your loan request was submitted. Leaders other than you must approve it' +
+        (guarantors.length ? ', and your guarantors must accept,' : '') +
+        ' before it is disbursed.',
+    };
+  }
+
+  /** Same answer as the first submit for a retried idempotency key. */
+  private replayLoanApplication(
+    existing: LoanApplication,
+    userId: string,
+    groupId: string,
+  ) {
+    if (existing.userId !== userId || existing.groupId !== groupId) {
+      throw new BadRequestException('This idempotency key was already used.');
+    }
+    return {
+      id: existing.id,
+      status: existing.status,
+      requestedAmount: decN(existing.requestedAmount),
+      replayed: true,
+      message: 'This loan request was already submitted.',
     };
   }
 

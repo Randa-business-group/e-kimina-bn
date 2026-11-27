@@ -57,6 +57,6 @@ export function getEmailConfig(): EmailConfig {
     },
     appUrl: process.env.APP_URL || 'http://localhost:4033',
     frontendUrl: pickFrontendUrl(),
-    appName: process.env.APP_NAME || 'nest-app',
+    appName: process.env.APP_NAME || 'E-kimina',
   };
 }

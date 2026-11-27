@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ContributionInterval } from '@prisma/client';
+import { ContributionInterval, PayoutMode } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   IsBoolean,
@@ -87,4 +87,13 @@ export class UpsertContributionConfigDto {
   @Min(0)
   @Max(30)
   reminderDaysBefore?: number;
+
+  @ApiPropertyOptional({
+    enum: PayoutMode,
+    description:
+      'SAVINGS_AND_LOANS (default) or ROTATING (tontine: the pot goes to one member per period)',
+  })
+  @IsOptional()
+  @IsEnum(PayoutMode)
+  payoutMode?: PayoutMode;
 }

@@ -7,7 +7,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  ApprovalEntityType,
+  GuarantorStatus,
   GroupMembershipStatus,
+  LedgerDirection,
+  LedgerEntryType,
   LoanApplicationStatus,
   LoanDisbursement,
   LoanDisbursementMethod,
@@ -18,6 +22,18 @@ import {
   RoleName,
 } from '@prisma/client';
 import { GroupCashService } from '../finance-core/group-cash.service';
+import {
+  createSchedule,
+  reschedule,
+  scheduleSnapshot,
+} from '../finance-core/loan-installments';
+import {
+  cycleResolver,
+  disbursementEntry,
+  splitLoanRepayment,
+  writeLedger,
+} from '../finance-core/ledger';
+import { afterLoanPayment } from '../finance-core/loan-installments';
 import {
   EPS,
   addDays,
@@ -112,6 +128,7 @@ export class GroupLoansService {
         treasurerApprovedBy: { select: { id: true, fullName: true } },
         rejectedBy: { select: { id: true, fullName: true } },
         memberLoan: { select: { id: true } },
+        guarantors: true,
       },
     });
     return apps.map((a) => this.toApplicationDto(a));
@@ -126,6 +143,7 @@ export class GroupLoansService {
         treasurerApprovedBy: { select: { id: true; fullName: true } };
         rejectedBy: { select: { id: true; fullName: true } };
         memberLoan: { select: { id: true } };
+        guarantors: true;
       };
     }>,
   ) {
@@ -149,7 +167,7 @@ export class GroupLoansService {
       groupId: a.groupId,
       groupName: a.group.name,
       requestedAmount: decN(a.requestedAmount),
-      currency: 'RWF',
+      currency: a.currency,
       interestRate: decN(a.interestRateSnapshot),
       repaymentPeriodDays: a.repaymentPeriodDaysSnapshot,
       maxAmountAtRequest:
@@ -166,6 +184,17 @@ export class GroupLoansService {
       rejectionReason: a.rejectionReason,
       rejectedAt: a.rejectedAt?.toISOString() ?? null,
       memberLoanId: a.memberLoan?.id ?? null,
+      purpose: a.purpose,
+      attachmentUrls: (a.attachmentUrls as string[] | null) ?? [],
+      interestMethod: a.interestMethodSnapshot,
+      installmentInterval: a.installmentIntervalSnapshot,
+      topUpOfLoanId: a.topUpOfLoanId,
+      guarantors: a.guarantors.map((g) => ({
+        id: g.id,
+        userId: g.guarantorUserId,
+        amount: decN(g.amountGuaranteed),
+        status: g.status,
+      })),
     };
   }
 
@@ -198,6 +227,367 @@ export class GroupLoansService {
     return null;
   }
 
+  /**
+   * Co-signers (msfts §3): a loan needs `loanApprovalsRequired` distinct leader approvals
+   * (capped at the leaders other than the applicant) and, when `loanRequireAdminAndTreasurer`,
+   * at least one group admin and one treasurer (the applicant's own role slot counts for this;
+   * the treasurer condition is waived while the group has no treasurer).
+   */
+  async loanApprovalState(
+    db: Prisma.TransactionClient,
+    app: {
+      id: string;
+      groupId: string;
+      userId: string;
+      groupAdminApprovedAt: Date | null;
+      groupAdminApprovedById: string | null;
+      treasurerApprovedAt: Date | null;
+      treasurerApprovedById: string | null;
+    },
+  ) {
+    const group = await db.group.findUniqueOrThrow({
+      where: { id: app.groupId },
+      select: {
+        loanApprovalsRequired: true,
+        loanRequireAdminAndTreasurer: true,
+      },
+    });
+    const approvals = await db.approval.findMany({
+      where: {
+        entityType: ApprovalEntityType.LOAN_APPLICATION,
+        entityId: app.id,
+      },
+      select: { userId: true },
+    });
+    const approvers = new Set(approvals.map((a) => a.userId));
+    for (const id of [app.groupAdminApprovedById, app.treasurerApprovedById]) {
+      if (id && id !== app.userId) approvers.add(id);
+    }
+    const leaders = await db.userGroup.findMany({
+      where: {
+        groupId: app.groupId,
+        membershipStatus: GroupMembershipStatus.ACTIVE,
+        role: { name: { in: [RoleName.GROUP_ADMIN, RoleName.TREASURER] } },
+      },
+      include: { role: true },
+    });
+    const otherLeaders = leaders.filter((l) => l.userId !== app.userId);
+    const required = Math.max(
+      1,
+      Math.min(group.loanApprovalsRequired, otherLeaders.length),
+    );
+    // Role of each approver (the applicant's own role never counts — msfts §4.3).
+    const roleOfApprover = new Map<string, RoleName>();
+    for (const a of await db.approval.findMany({
+      where: {
+        entityType: ApprovalEntityType.LOAN_APPLICATION,
+        entityId: app.id,
+      },
+      select: { userId: true, role: true },
+    })) {
+      roleOfApprover.set(a.userId, a.role);
+    }
+    if (
+      app.groupAdminApprovedById &&
+      app.groupAdminApprovedById !== app.userId
+    ) {
+      roleOfApprover.set(app.groupAdminApprovedById, RoleName.GROUP_ADMIN);
+    }
+    if (app.treasurerApprovedById && app.treasurerApprovedById !== app.userId) {
+      roleOfApprover.set(app.treasurerApprovedById, RoleName.TREASURER);
+    }
+    const approvedBy = (role: RoleName) =>
+      [...roleOfApprover.values()].includes(role);
+    const otherHas = (role: RoleName) =>
+      otherLeaders.some((l) => l.role.name === role);
+    const adminOk =
+      approvedBy(RoleName.GROUP_ADMIN) || !otherHas(RoleName.GROUP_ADMIN);
+    const treasurerOk =
+      approvedBy(RoleName.TREASURER) || !otherHas(RoleName.TREASURER);
+    const roleOk =
+      !group.loanRequireAdminAndTreasurer || (adminOk && treasurerOk);
+    const missing: string[] = [];
+    if (group.loanRequireAdminAndTreasurer && !adminOk)
+      missing.push('a group admin');
+    if (group.loanRequireAdminAndTreasurer && !treasurerOk)
+      missing.push('the treasurer');
+    const more = Math.max(0, required - approvers.size);
+    if (missing.length === 0 && more > 0)
+      missing.push(`${more} more leader approval${more > 1 ? 's' : ''}`);
+    return {
+      approved: approvers.size >= required && roleOk,
+      count: approvers.size,
+      required,
+      waitingFor: missing.join(' and ') || 'nothing',
+    };
+  }
+
+  /** Top-up: close the old loan with the new one (ledger IN for the old debt + matching OUT). */
+  private async refinance(
+    tx: Prisma.TransactionClient,
+    old: Prisma.MemberLoanGetPayload<object>,
+    newLoanId: string,
+    actorId: string,
+    now: Date,
+  ) {
+    const { penalty, balance } = loanBalances(old);
+    const split = splitLoanRepayment(old, balance);
+    await tx.memberLoan.update({
+      where: { id: old.id },
+      data: {
+        amountRepaid: old.totalRepayable,
+        penaltyAccrued: dec(0),
+        status: MemberLoanStatus.REPAID,
+        refinancedByLoanId: newLoanId,
+      },
+    });
+    await afterLoanPayment(tx, old.id, balance, true, now);
+    const base = {
+      groupId: old.groupId,
+      userId: old.userId,
+      memberLoanId: old.id,
+      createdById: actorId,
+      occurredAt: now,
+      description: 'Refinanced by top-up',
+    };
+    const pairs: [string, LedgerEntryType, number][] = [
+      ['penalty', LedgerEntryType.LOAN_PENALTY, penalty],
+      ['principal', LedgerEntryType.LOAN_PRINCIPAL, split.principal],
+      ['interest', LedgerEntryType.LOAN_INTEREST, split.interest],
+    ];
+    await writeLedger(
+      tx,
+      pairs.flatMap(([key, type, amount]) => [
+        {
+          ...base,
+          type,
+          direction: LedgerDirection.IN,
+          amount,
+          sourceKey: `topup:${newLoanId}:${key}`,
+        },
+        {
+          ...base,
+          type: LedgerEntryType.LOAN_DISBURSEMENT,
+          direction: LedgerDirection.OUT,
+          amount,
+          memberLoanId: newLoanId,
+          sourceKey: `topup:${newLoanId}:${key}:out`,
+        },
+      ]),
+    );
+  }
+
+  /** Last step of an approval: guarantors check, top-up, loan + schedule + payout record. */
+  private async disburseApproved(
+    tx: Prisma.TransactionClient,
+    after: Prisma.LoanApplicationGetPayload<object>,
+    groupId: string,
+    approverId: string,
+    momoPhone: string | null,
+    now: Date,
+  ) {
+    // Guarantors (msfts §4.2): enough must have accepted before the money goes out.
+    const cfg = await tx.loanConfig.findUnique({ where: { groupId } });
+    const accepted = await tx.loanGuarantor.count({
+      where: { loanApplicationId: after.id, status: GuarantorStatus.ACCEPTED },
+    });
+    if ((cfg?.guarantorsRequired ?? 0) > accepted) {
+      return {
+        applicationId: after.id,
+        status: 'PENDING' as const,
+        memberLoanId: null,
+        disbursementId: null,
+        alreadyOnFile: false,
+        message: `All approvals received. Waiting for ${(cfg?.guarantorsRequired ?? 0) - accepted} more guarantor(s) to accept before disbursement.`,
+      };
+    }
+
+    // Final approval: re-check what may have changed since the request.
+    const openLoan = await tx.memberLoan.findFirst({
+      where: {
+        userId: after.userId,
+        groupId,
+        status: { in: OPEN_LOAN_STATUSES },
+      },
+    });
+    // Top-up: the open loan being refinanced is allowed; any other open loan is not.
+    const refinanced =
+      openLoan &&
+      after.topUpOfLoanId === openLoan.id &&
+      openLoan.status === MemberLoanStatus.ACTIVE
+        ? openLoan
+        : null;
+    if (openLoan && !refinanced) {
+      throw new BadRequestException(
+        'The member already has an unpaid loan in this group.',
+      );
+    }
+    if (after.topUpOfLoanId && !refinanced) {
+      throw new BadRequestException('The loan to top up is no longer active.');
+    }
+    const principal = decN(after.requestedAmount);
+    const refinancedOutstanding = refinanced
+      ? loanBalances(refinanced).outstanding
+      : 0;
+    const cashOut = roundMoney(principal - refinancedOutstanding);
+    if (cashOut <= EPS) {
+      throw new BadRequestException(
+        `A top-up must be larger than the current balance (${refinancedOutstanding.toFixed(0)} RWF).`,
+      );
+    }
+    const available = await this.cash.getAvailableCash(groupId, tx);
+    if (cashOut - available > EPS) {
+      throw new BadRequestException(
+        `The group only has ${available.toFixed(0)} RWF available; this loan needs ${cashOut.toFixed(0)} RWF.`,
+      );
+    }
+
+    const loan = await tx.memberLoan.create({
+      data: {
+        userId: after.userId,
+        groupId: after.groupId,
+        applicationId: after.id,
+        principalAmount: after.requestedAmount,
+        totalRepayable: after.requestedAmount,
+        amountRepaid: dec(0),
+        currency: after.currency,
+        interestRateSnapshot: after.interestRateSnapshot,
+        repaymentPeriodDaysSnapshot: after.repaymentPeriodDaysSnapshot,
+        interestMethodSnapshot: after.interestMethodSnapshot,
+        installmentIntervalSnapshot: after.installmentIntervalSnapshot,
+        disbursedAt: now,
+        dueDate: addDays(now, after.repaymentPeriodDaysSnapshot),
+        status: MemberLoanStatus.ACTIVE,
+        cycleId: (await cycleResolver(tx, groupId))(now),
+        topUpOfLoanId: refinanced?.id ?? null,
+      },
+    });
+    // Schedule from today (rebuilt from the payout date when a MoMo payout completes).
+    await createSchedule(tx, loan, now);
+    await tx.loanGuarantor.updateMany({
+      where: { loanApplicationId: after.id, status: GuarantorStatus.ACCEPTED },
+      data: { memberLoanId: loan.id },
+    });
+    if (refinanced) {
+      await this.refinance(tx, refinanced, loan.id, approverId, now);
+    }
+    const viaMomo = momoPhone != null;
+    const disbursement = await tx.loanDisbursement.create({
+      data: {
+        memberLoanId: loan.id,
+        groupId,
+        amount: dec(cashOut),
+        currency: loan.currency,
+        method: viaMomo
+          ? LoanDisbursementMethod.MTN_MOMO
+          : LoanDisbursementMethod.RECORDED,
+        status: viaMomo
+          ? LoanDisbursementStatus.PENDING
+          : LoanDisbursementStatus.COMPLETED,
+        phone: momoPhone,
+        disbursedById: approverId,
+        completedAt: viaMomo ? null : now,
+      },
+    });
+    if (!viaMomo) {
+      // Recorded payout: the money leaves the savings fund now.
+      await writeLedger(tx, [
+        disbursementEntry({ ...disbursement, userId: after.userId }),
+      ]);
+    }
+    await tx.loanApplication.update({
+      where: { id: after.id },
+      data: { status: LoanApplicationStatus.APPROVED },
+    });
+    return {
+      applicationId: after.id,
+      status: 'APPROVED' as const,
+      memberLoanId: loan.id,
+      disbursementId: disbursement.id,
+      alreadyOnFile: false,
+      message:
+        (refinanced
+          ? `All approvals received. The old loan (${refinancedOutstanding.toFixed(0)} RWF) is closed by this top-up; ${cashOut.toFixed(0)} RWF goes to the member. `
+          : 'All approvals received. ') +
+        (viaMomo
+          ? 'The money is being paid out by MTN MoMo.'
+          : 'The loan is recorded as disbursed; hand the money over and keep the receipt.'),
+    };
+  }
+
+  /**
+   * A guarantor accepted: if every approval is already in, disburse now.
+   * Returns the memberLoanId when the loan went out.
+   */
+  async finalizeIfReady(
+    groupId: string,
+    applicationId: string,
+  ): Promise<string | null> {
+    const pre = await this.prisma.loanApplication.findFirst({
+      where: {
+        id: applicationId,
+        groupId,
+        status: LoanApplicationStatus.PENDING,
+      },
+    });
+    if (!pre) return null;
+    const actorId = pre.treasurerApprovedById ?? pre.groupAdminApprovedById;
+    if (!actorId) return null;
+    const momoPhone = (await this.momo.isEnabledFor('disbursement', groupId))
+      ? await this.payoutPhone(pre.userId, groupId)
+      : null;
+    const out = await this.prisma.$transaction(async (tx) => {
+      const app = await tx.loanApplication.findFirstOrThrow({
+        where: { id: applicationId },
+      });
+      if (app.status !== LoanApplicationStatus.PENDING) return null;
+      const state = await this.loanApprovalState(tx, app);
+      if (!state.approved) return null;
+      return this.disburseApproved(
+        tx,
+        app,
+        groupId,
+        actorId,
+        momoPhone,
+        new Date(),
+      );
+    });
+    if (
+      !out ||
+      out.status !== 'APPROVED' ||
+      !out.memberLoanId ||
+      !out.disbursementId
+    )
+      return null;
+    await this.afterDisbursementCreated(out.disbursementId, out.memberLoanId);
+    return out.memberLoanId;
+  }
+
+  /** Post-transaction side effects of a new loan: MoMo payout or "disbursed" notification. */
+  private async afterDisbursementCreated(
+    disbursementId: string,
+    memberLoanId: string,
+  ) {
+    const d = await this.prisma.loanDisbursement.findUniqueOrThrow({
+      where: { id: disbursementId },
+      include: {
+        memberLoan: { select: { userId: true } },
+        group: { select: { name: true } },
+      },
+    });
+    if (d.method === LoanDisbursementMethod.MTN_MOMO) {
+      await this.sendMomoDisbursement(d.id);
+    } else {
+      this.notifyDisbursed(
+        d.memberLoan.userId,
+        d.groupId,
+        d.group.name,
+        decN(d.amount),
+        memberLoanId,
+      );
+    }
+  }
+
   async approveLoanApplication(
     approverId: string,
     groupId: string,
@@ -212,7 +602,7 @@ export class GroupLoansService {
       select: { userId: true },
     });
     const momoPhone =
-      pre && this.momo.isEnabled('disbursement')
+      pre && (await this.momo.isEnabledFor('disbursement', groupId))
         ? await this.payoutPhone(pre.userId, groupId)
         : null;
 
@@ -229,120 +619,70 @@ export class GroupLoansService {
           'You cannot approve your own loan application.',
         );
       }
-      if (
-        (isAdmin && app.groupAdminApprovedAt) ||
-        (!isAdmin && app.treasurerApprovedAt)
-      ) {
+      const mine =
+        (await tx.approval.findUnique({
+          where: {
+            entityType_entityId_userId: {
+              entityType: ApprovalEntityType.LOAN_APPLICATION,
+              entityId: app.id,
+              userId: approverId,
+            },
+          },
+        })) != null ||
+        app.groupAdminApprovedById === approverId ||
+        app.treasurerApprovedById === approverId;
+      if (mine) {
         return {
           applicationId: app.id,
           status: 'PENDING' as const,
           memberLoanId: null as string | null,
           disbursementId: null as string | null,
           alreadyOnFile: true,
-          message: isAdmin
-            ? 'Group admin approval was already on file.'
-            : 'Treasurer approval was already on file.',
+          message: 'Your approval was already on file.',
         };
       }
 
+      await tx.approval.create({
+        data: {
+          groupId,
+          entityType: ApprovalEntityType.LOAN_APPLICATION,
+          entityId: app.id,
+          userId: approverId,
+          role,
+        },
+      });
+      // The role slots keep the first admin / treasurer approval (shown in the UI).
       const after = await tx.loanApplication.update({
         where: { id: applicationId },
         data: isAdmin
-          ? { groupAdminApprovedAt: now, groupAdminApprovedById: approverId }
-          : { treasurerApprovedAt: now, treasurerApprovedById: approverId },
+          ? app.groupAdminApprovedAt
+            ? {}
+            : { groupAdminApprovedAt: now, groupAdminApprovedById: approverId }
+          : app.treasurerApprovedAt
+            ? {}
+            : { treasurerApprovedAt: now, treasurerApprovedById: approverId },
       });
 
-      if (
-        after.groupAdminApprovedAt == null ||
-        after.treasurerApprovedAt == null
-      ) {
+      const state = await this.loanApprovalState(tx, after);
+      if (!state.approved) {
         return {
           applicationId: after.id,
           status: 'PENDING' as const,
           memberLoanId: null,
           disbursementId: null,
           alreadyOnFile: false,
-          message: isAdmin
-            ? 'Group admin approval recorded. Waiting for treasurer approval before the loan is disbursed.'
-            : 'Treasurer approval recorded. Waiting for group admin approval before the loan is disbursed.',
+          message: `Approval recorded (${state.count}/${state.required}). Waiting for ${state.waitingFor}.`,
         };
       }
 
-      // Final approval: re-check what may have changed since the request.
-      const openLoan = await tx.memberLoan.findFirst({
-        where: {
-          userId: after.userId,
-          groupId,
-          status: { in: OPEN_LOAN_STATUSES },
-        },
-        select: { id: true },
-      });
-      if (openLoan) {
-        throw new BadRequestException(
-          'The member already has an unpaid loan in this group.',
-        );
-      }
-      const principal = decN(after.requestedAmount);
-      const available = await this.cash.getAvailableCash(groupId, tx);
-      if (principal - available > EPS) {
-        throw new BadRequestException(
-          `The group only has ${available.toFixed(0)} RWF available; this loan needs ${principal.toFixed(0)} RWF.`,
-        );
-      }
-
-      const totalRep = roundMoney(
-        principal * (1 + decN(after.interestRateSnapshot) / 100),
+      return this.disburseApproved(
+        tx,
+        after,
+        groupId,
+        approverId,
+        momoPhone,
+        now,
       );
-      // Term counts from disbursement (reset again when a MoMo payout completes).
-      const due = addDays(now, after.repaymentPeriodDaysSnapshot);
-      const loan = await tx.memberLoan.create({
-        data: {
-          userId: after.userId,
-          groupId: after.groupId,
-          applicationId: after.id,
-          principalAmount: after.requestedAmount,
-          totalRepayable: dec(totalRep),
-          amountRepaid: dec(0),
-          currency: 'RWF',
-          interestRateSnapshot: after.interestRateSnapshot,
-          repaymentPeriodDaysSnapshot: after.repaymentPeriodDaysSnapshot,
-          disbursedAt: now,
-          dueDate: due,
-          status: MemberLoanStatus.ACTIVE,
-        },
-      });
-      const viaMomo = momoPhone != null;
-      const disbursement = await tx.loanDisbursement.create({
-        data: {
-          memberLoanId: loan.id,
-          groupId,
-          amount: after.requestedAmount,
-          currency: 'RWF',
-          method: viaMomo
-            ? LoanDisbursementMethod.MTN_MOMO
-            : LoanDisbursementMethod.RECORDED,
-          status: viaMomo
-            ? LoanDisbursementStatus.PENDING
-            : LoanDisbursementStatus.COMPLETED,
-          phone: momoPhone,
-          disbursedById: approverId,
-          completedAt: viaMomo ? null : now,
-        },
-      });
-      await tx.loanApplication.update({
-        where: { id: applicationId },
-        data: { status: LoanApplicationStatus.APPROVED },
-      });
-      return {
-        applicationId: after.id,
-        status: 'APPROVED' as const,
-        memberLoanId: loan.id,
-        disbursementId: disbursement.id,
-        alreadyOnFile: false,
-        message: viaMomo
-          ? 'Both approvals received. The loan is being paid out to the member by MTN MoMo.'
-          : 'Both approvals received. The loan is recorded as disbursed; hand the money over and keep the receipt.',
-      };
     });
 
     if (out.alreadyOnFile) return out;
@@ -360,20 +700,7 @@ export class GroupLoansService {
       out.memberLoanId &&
       out.disbursementId
     ) {
-      const d = await this.prisma.loanDisbursement.findUniqueOrThrow({
-        where: { id: out.disbursementId },
-      });
-      if (d.method === LoanDisbursementMethod.MTN_MOMO) {
-        await this.sendMomoDisbursement(d.id);
-      } else {
-        this.notifyDisbursed(
-          app.userId,
-          app.groupId,
-          app.group.name,
-          decN(app.requestedAmount),
-          out.memberLoanId,
-        );
-      }
+      await this.afterDisbursementCreated(out.disbursementId, out.memberLoanId);
     } else if (app && out.status === 'PENDING') {
       void this.notifications
         .notifyLoanAwaitingOtherApprover({
@@ -447,6 +774,13 @@ export class GroupLoansService {
         rejectedBy: { connect: { id: reviewerId } },
       },
     });
+    await this.prisma.loanGuarantor.updateMany({
+      where: {
+        loanApplicationId: applicationId,
+        status: { in: [GuarantorStatus.REQUESTED, GuarantorStatus.ACCEPTED] },
+      },
+      data: { status: GuarantorStatus.RELEASED, releasedAt: new Date() },
+    });
     void this.notifications
       .notifyLoanRejected({
         borrowerUserId: app.userId,
@@ -490,6 +824,7 @@ export class GroupLoansService {
         msisdn: d.phone,
         payerMessage: `E-kimina loan from ${d.group.name}`,
         payeeNote: `Loan ${d.memberLoanId}`,
+        groupId: d.groupId,
       });
     } catch (e) {
       await this.failDisbursement(
@@ -519,7 +854,7 @@ export class GroupLoansService {
       return d;
     }
     try {
-      const r = await this.momo.getTransferStatus(d.reference);
+      const r = await this.momo.getTransferStatus(d.reference, d.groupId);
       if (r.status === 'SUCCESSFUL') {
         await this.completeDisbursement(d.id, {
           providerTransactionId: r.financialTransactionId ?? null,
@@ -556,7 +891,9 @@ export class GroupLoansService {
     return { ok: true, status: after.status };
   }
 
-  async pollPendingDisbursements() {
+  async pollPendingDisbursements(
+    enqueue?: (disbursementId: string) => Promise<unknown>,
+  ) {
     const rows = await this.prisma.loanDisbursement.findMany({
       where: {
         status: LoanDisbursementStatus.PENDING,
@@ -567,8 +904,11 @@ export class GroupLoansService {
       select: { id: true },
       take: 50,
     });
-    for (const r of rows)
-      await this.refreshDisbursement(r.id).catch((e) => this.logger.error(e));
+    for (const r of rows) {
+      if (enqueue) await enqueue(r.id);
+      else
+        await this.refreshDisbursement(r.id).catch((e) => this.logger.error(e));
+    }
     return rows.length;
   }
 
@@ -633,6 +973,10 @@ export class GroupLoansService {
           dueDate: addDays(now, d.memberLoan.repaymentPeriodDaysSnapshot),
         },
       });
+      await createSchedule(tx, d.memberLoan, now);
+      await writeLedger(tx, [
+        disbursementEntry({ ...d, userId: d.memberLoan.userId }),
+      ]);
       return d;
     });
     if (done) {
@@ -712,7 +1056,7 @@ export class GroupLoansService {
     if (!d || d.status !== LoanDisbursementStatus.FAILED) {
       throw new BadRequestException('Only a failed payout can be retried.');
     }
-    if (!this.momo.isEnabled('disbursement')) {
+    if (!(await this.momo.isEnabledFor('disbursement', groupId))) {
       throw new BadRequestException(
         'MTN MoMo payouts are not available. Record a cash or bank payout instead.',
       );
@@ -873,17 +1217,21 @@ export class GroupLoansService {
         'The new due date must be later than the current due date and today.',
       );
     }
-    const updated = await this.prisma.memberLoan.update({
-      where: { id: loan.id },
-      data: {
-        originalDueDate: loan.originalDueDate ?? loan.dueDate,
-        dueDate: newDue,
-        status: MemberLoanStatus.ACTIVE,
-        defaultedAt: null,
-        // Penalties already charged stay; counting restarts from the new due date.
-        penaltyPeriodsApplied: 0,
-      },
-      include: loanInclude,
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // What is still owed is re-spread over new installments up to the new date.
+      await reschedule(tx, loan, newDue, new Date());
+      return tx.memberLoan.update({
+        where: { id: loan.id },
+        data: {
+          originalDueDate: loan.originalDueDate ?? loan.dueDate,
+          dueDate: newDue,
+          status: MemberLoanStatus.ACTIVE,
+          defaultedAt: null,
+          // Penalties already charged stay; new installments start without penalty.
+          penaltyPeriodsApplied: 0,
+        },
+        include: loanInclude,
+      });
     });
     const day = newDue.toISOString().slice(0, 10);
     void this.notifications
@@ -960,6 +1308,11 @@ export class GroupLoansService {
         l.writtenOffAmount != null ? decN(l.writtenOffAmount) : null,
       writeOffReason: l.writeOffReason,
       disbursement: this.toDisbursementDto(l.disbursement),
+      interestMethod: l.interestMethodSnapshot,
+      installmentInterval: l.installmentIntervalSnapshot,
+      rebateGranted: decN(l.rebateGranted),
+      topUpOfLoanId: l.topUpOfLoanId,
+      refinancedByLoanId: l.refinancedByLoanId,
     };
   }
 
@@ -970,9 +1323,24 @@ export class GroupLoansService {
   ) {
     await this.getActiveMembershipWithRole(userId, groupId);
     const loan = await this.prisma.memberLoan.findFirst({
-      where: { id: memberLoanId, userId, groupId },
+      where: { id: memberLoanId, groupId },
     });
     if (!loan) throw new NotFoundException('Loan not found for this group.');
+    // A guarantor whose guarantee was called may pay (up to what is still called).
+    let guaranteeLeft: number | null = null;
+    if (loan.userId !== userId) {
+      const g = await this.prisma.loanGuarantor.findFirst({
+        where: {
+          memberLoanId: loan.id,
+          guarantorUserId: userId,
+          status: GuarantorStatus.CALLED,
+        },
+      });
+      if (!g) throw new NotFoundException('Loan not found for this group.');
+      guaranteeLeft = roundMoney(
+        Math.max(0, decN(g.calledAmount) - decN(g.paidAmount)),
+      );
+    }
     if (!PAYABLE_LOAN_STATUSES.includes(loan.status)) {
       return {
         configured: false as const,
@@ -980,27 +1348,49 @@ export class GroupLoansService {
       };
     }
     const { penalty, balance, outstanding } = loanBalances(loan);
-    if (outstanding < EPS) {
+    if (outstanding < EPS || guaranteeLeft === 0) {
       return {
         configured: false as const,
-        message: 'This loan is already fully repaid.',
+        message:
+          guaranteeLeft === 0
+            ? 'Your guarantee is fully paid.'
+            : 'This loan is already fully repaid.',
       };
     }
     const lc = await this.prisma.loanConfig.findUnique({ where: { groupId } });
+    const now = new Date();
+    const snap = await scheduleSnapshot(
+      this.prisma,
+      loan,
+      now,
+      guaranteeLeft == null ? (lc?.earlyRepaymentRebatePercent ?? 0) : 0,
+    );
+    const total =
+      guaranteeLeft != null
+        ? Math.min(guaranteeLeft, outstanding)
+        : outstanding;
     return {
       configured: true as const,
       currency: loan.currency,
       status: loan.status,
       allowPartialPayments: lc?.allowPartialPayments ?? true,
-      totalDue: outstanding,
+      totalDue: total,
       principalPortion: 0,
       /** Accrued late penalty (paid first). */
-      finePortion: penalty,
+      finePortion: guaranteeLeft != null ? 0 : penalty,
       /** Remaining principal + interest. */
-      installmentPortion: balance,
-      total: outstanding,
+      installmentPortion: guaranteeLeft != null ? total : balance,
+      total,
       dueDate: loan.dueDate.toISOString(),
-      isOverdue: loan.dueDate < new Date(),
+      isOverdue: snap.overdueAmount > EPS,
+      /** Penalty + overdue installments + the next installment. */
+      dueNow:
+        guaranteeLeft != null ? total : Math.min(outstanding, snap.dueNow),
+      overdueAmount: snap.overdueAmount,
+      nextInstallment: snap.nextInstallment,
+      earlyPayoff: snap.earlyPayoff,
+      payingAsGuarantor: guaranteeLeft != null,
+      installments: snap.installments,
     };
   }
 }

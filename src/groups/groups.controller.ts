@@ -271,18 +271,25 @@ export class GroupsController {
   }
 
   @Post(':groupId/join')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Join a group as MEMBER (if capacity allows)' })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Join a public group. Creates a join request (PENDING_APPROVAL) when the group requires admin approval.',
+  })
   @ApiParam({ name: 'groupId', type: String })
-  @ApiNoContentResponse({ description: 'Joined successfully' })
   @ApiNotFoundResponse({ description: 'Group not found' })
   @ApiForbiddenResponse({ description: 'Forbidden' })
   @ApiUnauthorizedResponse({ description: 'Unauthorized' })
   async join(
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
+    @Body('message') message?: string,
   ) {
-    await this.groupsService.join(user.id, groupId);
+    return this.groupsService.join(
+      user.id,
+      groupId,
+      typeof message === 'string' ? message.slice(0, 500) : undefined,
+    );
   }
 
   @Post(':groupId/invite-member')

@@ -1,6 +1,6 @@
 export const appConfig = () => ({
   app: {
-    name: process.env.APP_NAME ?? 'nest-app',
+    name: process.env.APP_NAME ?? 'E-kimina API',
     version: process.env.APP_VERSION ?? '0.0.1',
     nodeEnv: process.env.NODE_ENV ?? 'development',
     port: Number(process.env.PORT ?? 3000),
@@ -17,6 +17,7 @@ export const appConfig = () => ({
     cloudinaryCloudName: (process.env.CLOUDINARY_CLOUD_NAME ?? '').trim(),
     cloudinaryApiKey: (process.env.CLOUDINARY_API_KEY ?? '').trim(),
     cloudinaryApiSecret: (process.env.CLOUDINARY_API_SECRET ?? '').trim(),
-    cloudinaryFolder: (process.env.CLOUDINARY_FOLDER ?? 'e-kimina').trim() || 'e-kimina',
+    cloudinaryFolder:
+      (process.env.CLOUDINARY_FOLDER ?? 'e-kimina').trim() || 'e-kimina',
   },
 });

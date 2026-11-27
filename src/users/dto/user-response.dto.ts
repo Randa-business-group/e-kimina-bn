@@ -25,11 +25,15 @@ export class UserResponseDto {
   @ApiPropertyOptional({ example: '+250788000000', nullable: true })
   phoneNumber!: string | null;
 
-  @ApiPropertyOptional({ example: 'https://cdn.example.com/u/1.jpg', nullable: true })
+  @ApiPropertyOptional({
+    example: 'https://cdn.example.com/u/1.jpg',
+    nullable: true,
+  })
   image!: string | null;
 
   @ApiProperty({
-    description: 'True after email verification (OTP) or treasurer invitation completion.',
+    description:
+      'True after email verification (OTP) or treasurer invitation completion.',
   })
   emailVerified!: boolean;
 

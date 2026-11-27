@@ -2,16 +2,28 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import {
   AllocationKind,
   ContributionStatus,
-  DepositPurpose,
   DepositRecord,
   FineStatus,
+  FundType,
+  GuarantorStatus,
   MemberLoan,
   MemberLoanStatus,
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ContributionScheduleService } from './contribution-schedule.service';
+import { ledgerEntriesForDeposit, writeLedger } from './ledger';
+import {
+  applyToInstallments,
+  markAllInstallmentsPaid,
+  scheduleSnapshot,
+} from './loan-installments';
 import { EPS, dec, decN, roundMoney } from './money.util';
+import {
+  allocateInOrder,
+  allocationSteps,
+  splitLoanPayment,
+} from './allocation-plan';
 
 type Db = Prisma.TransactionClient;
 
@@ -108,7 +120,20 @@ export class PaymentAllocationService {
     const contributionTotal = roundMoney(
       rowItems.reduce((s, x) => s + x.remaining, 0),
     );
-    return { fines: fineItems, rows: rowItems, fineTotal, contributionTotal };
+    /** Part of contributionTotal that feeds the social fund. */
+    const socialTotal = roundMoney(
+      rowItems
+        .filter((x) => x.row.fund === FundType.SOCIAL)
+        .reduce((s, x) => s + x.remaining, 0),
+    );
+    return {
+      fines: fineItems,
+      rows: rowItems,
+      fineTotal,
+      contributionTotal,
+      savingsTotal: roundMoney(contributionTotal - socialTotal),
+      socialTotal,
+    };
   }
 
   /** Member's loan that can receive repayments (most recent first). */
@@ -126,7 +151,7 @@ export class PaymentAllocationService {
     deposit: Pick<
       DepositRecord,
       'id' | 'userId' | 'groupId' | 'amount' | 'purpose' | 'memberLoanId'
-    >,
+    > & { earlyPayoff?: boolean },
     now = new Date(),
   ): Promise<SettlementResult> {
     const lines: AllocationLine[] = [];
@@ -144,12 +169,14 @@ export class PaymentAllocationService {
         remaining,
         lines,
         loansRepaid,
+        now,
+        deposit.earlyPayoff === true,
       );
     };
 
-    switch (deposit.purpose) {
-      case DepositPurpose.LOAN_REPAYMENT:
-        await payLoan(deposit.memberLoanId);
+    for (const step of allocationSteps(deposit.purpose)) {
+      if (step === 'loan') await payLoan(deposit.memberLoanId);
+      else {
         remaining = await this.payContributionSide(
           tx,
           groupId,
@@ -157,42 +184,9 @@ export class PaymentAllocationService {
           remaining,
           lines,
           now,
-          true,
+          step === 'advance',
         );
-        break;
-      case DepositPurpose.COMBINED:
-        remaining = await this.payContributionSide(
-          tx,
-          groupId,
-          userId,
-          remaining,
-          lines,
-          now,
-          false,
-        );
-        await payLoan(deposit.memberLoanId);
-        remaining = await this.payContributionSide(
-          tx,
-          groupId,
-          userId,
-          remaining,
-          lines,
-          now,
-          true,
-        );
-        break;
-      case DepositPurpose.CONTRIBUTION:
-      default:
-        remaining = await this.payContributionSide(
-          tx,
-          groupId,
-          userId,
-          remaining,
-          lines,
-          now,
-          true,
-        );
-        break;
+      }
     }
 
     if (remaining > EPS) {
@@ -236,6 +230,12 @@ export class PaymentAllocationService {
         installmentPortion: dec(result.installmentPortion),
       },
     });
+
+    // Cash book: one ledger line per allocation (loan repayments split principal / interest).
+    const confirmed = await tx.depositRecord.findUniqueOrThrow({
+      where: { id: deposit.id },
+    });
+    await writeLedger(tx, await ledgerEntriesForDeposit(tx, confirmed));
     return result;
   }
 
@@ -252,9 +252,12 @@ export class PaymentAllocationService {
     if (remaining < EPS) return 0;
     const open = await this.getOpenObligations(groupId, userId, tx);
 
-    for (const { fine, remaining: due } of open.fines) {
-      if (remaining < EPS) break;
-      const pay = roundMoney(Math.min(remaining, due));
+    const finePlan = allocateInOrder(
+      remaining,
+      open.fines.map((f) => ({ id: f.fine.id, remaining: f.remaining })),
+    );
+    for (const { id, pay } of finePlan.pays) {
+      const fine = open.fines.find((f) => f.fine.id === id)!.fine;
       const newPaid = roundMoney(decN(fine.amountPaid) + pay);
       const full = newPaid >= decN(fine.amount) - EPS;
       await tx.fine.update({
@@ -265,8 +268,8 @@ export class PaymentAllocationService {
         },
       });
       lines.push({ kind: AllocationKind.FINE, amount: pay, fineId: fine.id });
-      remaining = roundMoney(remaining - pay);
     }
+    remaining = finePlan.left;
 
     const payRow = async (row: {
       id: string;
@@ -314,26 +317,62 @@ export class PaymentAllocationService {
     return remaining;
   }
 
+  /**
+   * Pay into a loan: penalty first, then the balance (spread over installments oldest first).
+   * The payer is the borrower, or a guarantor whose guarantee was CALLED. With `earlyPayoff`,
+   * the early-repayment rebate is granted when the payment clears the loan.
+   */
   private async payLoan(
     tx: Db,
     loanId: string,
-    userId: string,
+    payerId: string,
     groupId: string,
     amount: number,
     lines: AllocationLine[],
     loansRepaid: string[],
+    now: Date,
+    earlyPayoff: boolean,
   ): Promise<number> {
     let remaining = roundMoney(amount);
     const loan = await tx.memberLoan.findFirst({
-      where: { id: loanId, userId, groupId },
+      where: { id: loanId, groupId },
     });
     if (!loan || !PAYABLE_LOAN_STATUSES.includes(loan.status)) return remaining;
+    let guarantee: { id: string; paidAmount: Prisma.Decimal } | null = null;
+    if (loan.userId !== payerId) {
+      guarantee = await tx.loanGuarantor.findFirst({
+        where: {
+          memberLoanId: loan.id,
+          guarantorUserId: payerId,
+          status: GuarantorStatus.CALLED,
+        },
+        select: { id: true, paidAmount: true },
+      });
+      if (!guarantee) return remaining;
+    }
 
-    const { penalty, balance } = loanBalances(loan);
-    const toPenalty = roundMoney(Math.min(remaining, penalty));
-    remaining = roundMoney(remaining - toPenalty);
-    const toBalance = roundMoney(Math.min(remaining, balance));
-    remaining = roundMoney(remaining - toBalance);
+    let { penalty, balance } = loanBalances(loan);
+    let rebate = 0;
+    if (earlyPayoff && !guarantee) {
+      const cfg = await tx.loanConfig.findUnique({
+        where: { groupId },
+        select: { earlyRepaymentRebatePercent: true },
+      });
+      const snap = await scheduleSnapshot(
+        tx,
+        loan,
+        now,
+        cfg?.earlyRepaymentRebatePercent ?? 0,
+      );
+      if (snap.earlyPayoff && remaining >= snap.earlyPayoff.amount - EPS) {
+        rebate = snap.earlyPayoff.rebate;
+        balance = roundMoney(balance - rebate);
+      }
+    }
+
+    const split = splitLoanPayment(remaining, penalty, balance);
+    const { toPenalty, toBalance } = split;
+    remaining = split.left;
     if (toPenalty < EPS && toBalance < EPS) return remaining;
 
     if (toPenalty > EPS) {
@@ -350,19 +389,42 @@ export class PaymentAllocationService {
         memberLoanId: loan.id,
       });
     }
-    const newPenalty = roundMoney(penalty - toPenalty);
+    penalty = roundMoney(penalty - toPenalty);
+    const totalRepayable = roundMoney(decN(loan.totalRepayable) - rebate);
     const newRepaid = roundMoney(decN(loan.amountRepaid) + toBalance);
-    const cleared =
-      newPenalty + Math.max(0, decN(loan.totalRepayable) - newRepaid) < EPS;
+    const cleared = penalty + Math.max(0, totalRepayable - newRepaid) < EPS;
     await tx.memberLoan.update({
       where: { id: loan.id },
       data: {
-        penaltyAccrued: dec(newPenalty),
+        penaltyAccrued: dec(penalty),
         amountRepaid: dec(newRepaid),
+        ...(rebate > EPS
+          ? { totalRepayable: dec(totalRepayable), rebateGranted: dec(rebate) }
+          : {}),
         ...(cleared ? { status: MemberLoanStatus.REPAID } : {}),
       },
     });
-    if (cleared) loansRepaid.push(loan.id);
+    if (cleared) {
+      await markAllInstallmentsPaid(tx, loan.id, now);
+      await tx.loanGuarantor.updateMany({
+        where: {
+          memberLoanId: loan.id,
+          status: { in: [GuarantorStatus.ACCEPTED, GuarantorStatus.CALLED] },
+        },
+        data: { status: GuarantorStatus.RELEASED, releasedAt: now },
+      });
+      loansRepaid.push(loan.id);
+    } else {
+      await applyToInstallments(tx, loan.id, toBalance, now);
+    }
+    if (guarantee) {
+      await tx.loanGuarantor.update({
+        where: { id: guarantee.id },
+        data: {
+          paidAmount: dec(decN(guarantee.paidAmount) + toPenalty + toBalance),
+        },
+      });
+    }
     return remaining;
   }
 }

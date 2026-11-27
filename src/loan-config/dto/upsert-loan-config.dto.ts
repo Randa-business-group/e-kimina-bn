@@ -1,7 +1,9 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { InstallmentInterval, InterestMethod } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   IsBoolean,
+  IsEnum,
   IsInt,
   IsNumber,
   IsOptional,
@@ -102,4 +104,48 @@ export class UpsertLoanConfigDto {
   @IsOptional()
   @IsBoolean()
   blockIfArrears?: boolean;
+
+  @ApiPropertyOptional({
+    enum: InterestMethod,
+    description: 'FLAT (default) or REDUCING balance',
+  })
+  @IsOptional()
+  @IsEnum(InterestMethod)
+  interestMethod?: InterestMethod;
+
+  @ApiPropertyOptional({
+    enum: InstallmentInterval,
+    description:
+      'SINGLE (one repayment) or WEEKLY / BIWEEKLY / MONTHLY installments',
+  })
+  @IsOptional()
+  @IsEnum(InstallmentInterval)
+  installmentInterval?: InstallmentInterval;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description: 'Accepted guarantors needed before disbursement (0 = none)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(5)
+  guarantorsRequired?: number;
+
+  @ApiPropertyOptional({ description: 'Allow topping up an ACTIVE loan' })
+  @IsOptional()
+  @IsBoolean()
+  allowTopUp?: boolean;
+
+  @ApiPropertyOptional({
+    example: 50,
+    description: '% of not-yet-due interest waived on early full repayment',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(100)
+  earlyRepaymentRebatePercent?: number;
 }

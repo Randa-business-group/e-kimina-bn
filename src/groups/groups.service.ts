@@ -9,9 +9,11 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  ContributionStatus,
   DepositRecordStatus,
+  ExitKind,
+  ExitRequestStatus,
   GroupMembershipStatus,
-  GroupRemovalKind,
   GroupVerificationStatus,
   LoanApplicationStatus,
   LoanDisbursementStatus,
@@ -42,7 +44,13 @@ const groupSelect = {
   verificationRequestedAt: true,
   verificationRejectionReason: true,
   deletedAt: true,
+  maxMembers: true,
   minMembers: true,
+  joinRequiresApproval: true,
+  loanApprovalsRequired: true,
+  loanRequireAdminAndTreasurer: true,
+  expenseApprovalsRequired: true,
+  constitutionRequired: true,
   createdAt: true,
 } satisfies Prisma.GroupSelect;
 
@@ -50,10 +58,8 @@ export type GroupSummary = Prisma.GroupGetPayload<{
   select: typeof groupSelect;
 }>;
 
-/** API shape: `minMembers` in DB is exposed as `maxMembers` to clients. */
-export type GroupApiRow = Omit<GroupSummary, 'minMembers'> & {
-  maxMembers: number;
-};
+/** API shape (maxMembers = cap, minMembers = needed before verification). */
+export type GroupApiRow = GroupSummary;
 
 export type GroupListFilter = {
   view?: 'mine' | 'discover';
@@ -83,14 +89,16 @@ export class GroupsService {
   private groupWithMemberCount(
     group: GroupSummary,
     memberCount: number,
-  ): GroupApiRow & { memberCount: number } {
-    const { minMembers, ...rest } = group;
-    return { ...rest, maxMembers: minMembers, memberCount };
+  ): GroupApiRow & { memberCount: number; meetsMinimum: boolean } {
+    return {
+      ...group,
+      memberCount,
+      meetsMinimum: memberCount >= group.minMembers,
+    };
   }
 
   private toGroupApiRow(group: GroupSummary): GroupApiRow {
-    const { minMembers, ...rest } = group;
-    return { ...rest, maxMembers: minMembers };
+    return group;
   }
 
   private async compensateTreasurerInviteFailure(
@@ -211,7 +219,12 @@ export class GroupsService {
     }
 
     const seatsNeeded = 1 + (normalizedTreasurerEmail ? 1 : 0);
-    if (dto.minMembers < seatsNeeded) {
+    if (dto.minMembers != null && dto.minMembers > dto.maxMembers) {
+      throw new BadRequestException(
+        'Minimum members cannot exceed the maximum.',
+      );
+    }
+    if (dto.maxMembers < seatsNeeded) {
       throw new BadRequestException(
         `Minimum members must be at least ${seatsNeeded} (admin${normalizedTreasurerEmail ? ' + treasurer' : ''}).`,
       );
@@ -233,7 +246,8 @@ export class GroupsService {
             name: dto.name,
             description: dto.description,
             createdById: userId,
-            minMembers: dto.minMembers,
+            maxMembers: dto.maxMembers,
+            ...(dto.minMembers != null ? { minMembers: dto.minMembers } : {}),
             isPublic: dto.isPublic ?? false,
             ...(process.env.GROUPS_AUTO_VERIFY === 'true'
               ? {
@@ -456,7 +470,16 @@ export class GroupsService {
     throw new ForbiddenException('You do not have access to this group.');
   }
 
-  async join(userId: string, groupId: string): Promise<void> {
+  /**
+   * Join a public group. With `joinRequiresApproval` (default) this creates a join request
+   * (PENDING_APPROVAL) that a group admin approves; otherwise the user becomes ACTIVE at once.
+   * A member who left (EXITED) can come back the same way.
+   */
+  async join(
+    userId: string,
+    groupId: string,
+    message?: string,
+  ): Promise<{ status: GroupMembershipStatus; message: string }> {
     const group = await this.prisma.group.findUnique({
       where: { id: groupId },
     });
@@ -472,12 +495,7 @@ export class GroupsService {
     }
 
     const existing = await this.prisma.userGroup.findUnique({
-      where: {
-        userId_groupId: {
-          userId,
-          groupId,
-        },
-      },
+      where: { userId_groupId: { userId, groupId } },
     });
 
     if (existing) {
@@ -486,30 +504,67 @@ export class GroupsService {
           'Your membership in this group is suspended. Contact the group admin.',
         );
       }
-      throw new ConflictException('You are already a member of this group.');
+      if (
+        existing.membershipStatus === GroupMembershipStatus.PENDING_APPROVAL
+      ) {
+        throw new ConflictException(
+          'Your request to join is already waiting for the group admin.',
+        );
+      }
+      if (existing.membershipStatus === GroupMembershipStatus.ACTIVE) {
+        throw new ConflictException('You are already a member of this group.');
+      }
     }
 
     const memberCount = await this.countActiveMembers(groupId);
-
-    if (memberCount >= group.minMembers) {
+    if (memberCount >= group.maxMembers) {
       throw new BadRequestException('This group has reached its member limit.');
     }
 
     const memberRoleId = await this.rolesService.getRoleId(RoleName.MEMBER);
+    const now = new Date();
+    const status = group.joinRequiresApproval
+      ? GroupMembershipStatus.PENDING_APPROVAL
+      : GroupMembershipStatus.ACTIVE;
+    const data = {
+      roleId: memberRoleId,
+      membershipStatus: status,
+      joinedAt: now,
+      joinRequestedAt:
+        status === GroupMembershipStatus.PENDING_APPROVAL ? now : null,
+      joinMessage: message?.trim() || null,
+      exitedAt: null,
+    };
+    if (existing) {
+      await this.prisma.userGroup.update({ where: { id: existing.id }, data });
+    } else {
+      await this.prisma.userGroup.create({
+        data: { userId, groupId, ...data },
+      });
+    }
 
-    await this.prisma.userGroup.create({
-      data: {
-        userId,
-        groupId,
-        roleId: memberRoleId,
-        membershipStatus: GroupMembershipStatus.ACTIVE,
-      },
-    });
-    this.ensureMemberSchedule(groupId, userId);
     const joiner = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { fullName: true },
     });
+
+    if (status === GroupMembershipStatus.PENDING_APPROVAL) {
+      void this.notifications
+        .notifyGroupAdmins({
+          groupId,
+          type: NotificationType.JOIN_REQUESTED,
+          title: 'New join request',
+          body: `${joiner?.fullName ?? 'Someone'} asked to join ${group.name}.${message?.trim() ? ` “${message.trim()}”` : ''}`,
+          metadata: { groupName: group.name, userId },
+        })
+        .catch((e) => this.logger.error(e));
+      return {
+        status,
+        message: 'Your request was sent. A group admin will review it.',
+      };
+    }
+
+    this.ensureMemberSchedule(groupId, userId);
     if (joiner) {
       void this.notifications
         .notifyUserAddedToGroup({
@@ -529,6 +584,40 @@ export class GroupsService {
         })
         .catch((e) => this.logger.error(e));
     }
+    return { status, message: 'You joined the group.' };
+  }
+
+  /**
+   * Make an existing user an ACTIVE member (invite / join approval / re-join after exit).
+   * Returns true when a membership row was (re)activated.
+   */
+  async activateMembership(groupId: string, userId: string): Promise<void> {
+    const memberRoleId = await this.rolesService.getRoleId(RoleName.MEMBER);
+    const existing = await this.prisma.userGroup.findUnique({
+      where: { userId_groupId: { userId, groupId } },
+    });
+    if (existing) {
+      await this.prisma.userGroup.update({
+        where: { id: existing.id },
+        data: {
+          membershipStatus: GroupMembershipStatus.ACTIVE,
+          ...(existing.membershipStatus === GroupMembershipStatus.EXITED
+            ? { roleId: memberRoleId, joinedAt: new Date(), exitedAt: null }
+            : {}),
+          joinRequestedAt: null,
+        },
+      });
+    } else {
+      await this.prisma.userGroup.create({
+        data: {
+          userId,
+          groupId,
+          roleId: memberRoleId,
+          membershipStatus: GroupMembershipStatus.ACTIVE,
+        },
+      });
+    }
+    this.ensureMemberSchedule(groupId, userId);
   }
 
   /**
@@ -542,16 +631,16 @@ export class GroupsService {
   ): Promise<{ message: string }> {
     const group = await this.prisma.group.findUnique({
       where: { id: groupId },
-      select: { id: true, name: true, minMembers: true },
+      select: { id: true, name: true, maxMembers: true, deletedAt: true },
     });
-    if (!group) {
+    if (!group || group.deletedAt) {
       throw new NotFoundException(`Group ${groupId} was not found.`);
     }
 
     await this.assertGroupAdmin(inviterUserId, groupId);
 
     const memberCount = await this.countActiveMembers(groupId);
-    if (memberCount >= group.minMembers) {
+    if (memberCount >= group.maxMembers) {
       throw new BadRequestException('This group has reached its member limit.');
     }
 
@@ -630,19 +719,14 @@ export class GroupsService {
             'This user is suspended in this group. Reactivate them from the group page.',
           );
         }
-        throw new ConflictException(
-          'This user is already a member of this group.',
-        );
+        if (ug.membershipStatus === GroupMembershipStatus.ACTIVE) {
+          throw new ConflictException(
+            'This user is already a member of this group.',
+          );
+        }
+        // EXITED (re-join) or PENDING_APPROVAL (invite = approval).
       }
-      await this.prisma.userGroup.create({
-        data: {
-          userId: existing.id,
-          groupId,
-          roleId: memberRoleId,
-          membershipStatus: GroupMembershipStatus.ACTIVE,
-        },
-      });
-      this.ensureMemberSchedule(groupId, existing.id);
+      await this.activateMembership(groupId, existing.id);
       void this.notifications
         .notifyUserAddedToGroup({
           userId: existing.id,
@@ -767,34 +851,13 @@ export class GroupsService {
     };
   }
 
+  /** Removal / suspension notices (now stored as UserNotification, msfts §7). */
   async listRemovalNotifications(userId: string) {
-    return this.prisma.groupRemovalNotification.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-      select: {
-        id: true,
-        groupId: true,
-        groupName: true,
-        kind: true,
-        reason: true,
-        readAt: true,
-        createdAt: true,
-      },
-    });
+    return this.notifications.listMembershipNotices(userId);
   }
 
   async markRemovalNotificationRead(userId: string, notificationId: string) {
-    const row = await this.prisma.groupRemovalNotification.findFirst({
-      where: { id: notificationId, userId },
-    });
-    if (!row) {
-      throw new NotFoundException('Notification not found.');
-    }
-    await this.prisma.groupRemovalNotification.update({
-      where: { id: notificationId },
-      data: { readAt: new Date() },
-    });
+    await this.notifications.markRead(userId, notificationId);
   }
 
   async updateGroup(
@@ -979,35 +1042,53 @@ export class GroupsService {
     memberUserId: string,
     reason: string,
   ): Promise<void> {
-    const group = await this.prisma.group.findUnique({
-      where: { id: groupId },
-      select: { id: true, name: true, createdById: true },
-    });
-    if (!group) {
-      throw new NotFoundException(`Group ${groupId} was not found.`);
-    }
     await this.assertGroupAdmin(actorUserId, groupId);
-
-    if (memberUserId === group.createdById) {
-      throw new BadRequestException(
-        'Cannot remove the group creator from the group.',
-      );
-    }
     if (memberUserId === actorUserId) {
       throw new BadRequestException(
         'You cannot remove yourself from the group.',
       );
     }
+    await this.removeMemberInternal(groupId, memberUserId, reason, actorUserId);
+  }
 
-    const ug = await this.prisma.userGroup.findUnique({
-      where: {
-        userId_groupId: { userId: memberUserId, groupId },
-      },
+  /**
+   * Soft removal (admin or group vote): membership becomes EXITED, unpaid periods are cancelled
+   * and an exit settlement (refund of savings minus debts) is opened for the leaders.
+   */
+  async removeMemberInternal(
+    groupId: string,
+    memberUserId: string,
+    reason: string,
+    actorUserId: string,
+  ): Promise<void> {
+    const group = await this.prisma.group.findUnique({
+      where: { id: groupId },
+      select: { id: true, name: true },
     });
-    if (!ug) {
+    if (!group) {
+      throw new NotFoundException(`Group ${groupId} was not found.`);
+    }
+    const ug = await this.prisma.userGroup.findUnique({
+      where: { userId_groupId: { userId: memberUserId, groupId } },
+      include: { role: true },
+    });
+    if (!ug || ug.membershipStatus === GroupMembershipStatus.EXITED) {
       throw new NotFoundException('This user is not in the group.');
     }
-
+    if (ug.role.name === RoleName.GROUP_ADMIN) {
+      const admins = await this.prisma.userGroup.count({
+        where: {
+          groupId,
+          membershipStatus: GroupMembershipStatus.ACTIVE,
+          role: { name: RoleName.GROUP_ADMIN },
+        },
+      });
+      if (admins <= 1) {
+        throw new BadRequestException(
+          'This is the only group admin. Appoint another admin before removing them.',
+        );
+      }
+    }
     const trimmed = reason.trim();
     if (trimmed.length < 3) {
       throw new BadRequestException(
@@ -1015,18 +1096,61 @@ export class GroupsService {
       );
     }
 
+    const now = new Date();
     await this.prisma.$transaction(async (tx) => {
-      await tx.groupRemovalNotification.create({
-        data: {
-          userId: memberUserId,
+      await tx.userGroup.update({
+        where: { id: ug.id },
+        data: { membershipStatus: GroupMembershipStatus.EXITED, exitedAt: now },
+      });
+      await tx.contribution.updateMany({
+        where: {
           groupId,
-          groupName: group.name,
-          kind: GroupRemovalKind.REMOVED,
+          userId: memberUserId,
+          status: {
+            in: [
+              ContributionStatus.PENDING,
+              ContributionStatus.PARTIALLY_PAID,
+              ContributionStatus.LATE,
+            ],
+          },
+        },
+        data: { status: ContributionStatus.CANCELLED },
+      });
+      await tx.loanApplication.updateMany({
+        where: {
+          groupId,
+          userId: memberUserId,
+          status: LoanApplicationStatus.PENDING,
+        },
+        data: { status: LoanApplicationStatus.CANCELLED },
+      });
+      await tx.exitRequest.updateMany({
+        where: {
+          groupId,
+          userId: memberUserId,
+          status: ExitRequestStatus.PENDING,
+        },
+        data: { status: ExitRequestStatus.CANCELLED },
+      });
+      await tx.exitRequest.create({
+        data: {
+          groupId,
+          userId: memberUserId,
+          kind: ExitKind.REMOVED,
           reason: trimmed,
+          requestedById: actorUserId,
         },
       });
-      await tx.userGroup.delete({ where: { id: ug.id } });
     });
+    void this.notifications
+      .notifyMembershipChange({
+        userId: memberUserId,
+        groupId,
+        groupName: group.name,
+        kind: 'REMOVED',
+        reason: trimmed,
+      })
+      .catch((e) => this.logger.error(e));
   }
 
   async suspendMember(
@@ -1072,21 +1196,19 @@ export class GroupsService {
       );
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.groupRemovalNotification.create({
-        data: {
-          userId: memberUserId,
-          groupId,
-          groupName: group.name,
-          kind: GroupRemovalKind.SUSPENDED,
-          reason: trimmed,
-        },
-      });
-      await tx.userGroup.update({
-        where: { id: ug.id },
-        data: { membershipStatus: GroupMembershipStatus.SUSPENDED },
-      });
+    await this.prisma.userGroup.update({
+      where: { id: ug.id },
+      data: { membershipStatus: GroupMembershipStatus.SUSPENDED },
     });
+    void this.notifications
+      .notifyMembershipChange({
+        userId: memberUserId,
+        groupId,
+        groupName: group.name,
+        kind: 'SUSPENDED',
+        reason: trimmed,
+      })
+      .catch((e) => this.logger.error(e));
   }
 
   async reactivateMember(
@@ -1113,6 +1235,18 @@ export class GroupsService {
       data: { membershipStatus: GroupMembershipStatus.ACTIVE },
     });
     this.ensureMemberSchedule(groupId, memberUserId);
+    const g = await this.prisma.group.findUnique({
+      where: { id: groupId },
+      select: { name: true },
+    });
+    void this.notifications
+      .notifyMembershipChange({
+        userId: memberUserId,
+        groupId,
+        groupName: g?.name ?? 'your group',
+        kind: 'REACTIVATED',
+      })
+      .catch((e) => this.logger.error(e));
   }
 
   async togglePublic(
@@ -1164,6 +1298,12 @@ export class GroupsService {
     if (group.verificationStatus === GroupVerificationStatus.PENDING) {
       throw new BadRequestException(
         'A verification request is already waiting for review.',
+      );
+    }
+    const active = await this.countActiveMembers(groupId);
+    if (active < group.minMembers) {
+      throw new BadRequestException(
+        `The group needs at least ${group.minMembers} active members before verification (it has ${active}).`,
       );
     }
     const updated = await this.prisma.group.update({

@@ -14,14 +14,12 @@ enum RoleName {
   MEMBER
 }
 
+/// PENDING_APPROVAL: join request waiting for an admin · EXITED: left or removed (history kept)
 enum GroupMembershipStatus {
+  PENDING_APPROVAL
   ACTIVE
   SUSPENDED
-}
-
-enum GroupRemovalKind {
-  REMOVED
-  SUSPENDED
+  EXITED
 }
 
 /// PENDING: not paid, not overdue · PARTIALLY_PAID: some money allocated, not overdue
@@ -31,6 +29,104 @@ enum ContributionStatus {
   PARTIALLY_PAID
   PAID
   LATE
+  /// Member exited before paying this period
+  CANCELLED
+}
+
+/// SAVINGS = main pot (contributions, loans, share-out). SOCIAL = emergency fund (ingoboka).
+enum FundType {
+  SAVINGS
+  SOCIAL
+}
+
+enum LedgerDirection {
+  IN
+  OUT
+}
+
+enum LedgerEntryType {
+  CONTRIBUTION
+  FINE
+  LOAN_DISBURSEMENT
+  LOAN_PRINCIPAL
+  LOAN_INTEREST
+  LOAN_PENALTY
+  EXPENSE
+  SOCIAL_PAYOUT
+  SHARE_OUT
+  ROTATION_PAYOUT
+  OPENING_BALANCE
+  ADJUSTMENT
+  /// Savings refunded to a member who leaves (and debts offset against them)
+  EXIT_REFUND
+}
+
+enum CycleStatus {
+  ACTIVE
+  /// Share-out prepared, waiting for group admin approval
+  CLOSING
+  CLOSED
+}
+
+enum ShareOutStatus {
+  /// Calculated, not yet paid
+  PENDING
+  PAID
+  /// Reinvested as opening balance of the next cycle
+  CARRIED_OVER
+}
+
+enum ExpenseCategory {
+  BANK_FEES
+  MEETING
+  STATIONERY
+  TRANSPORT
+  COMMUNICATION
+  OTHER
+}
+
+enum ExpenseStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum SocialPayoutReason {
+  FUNERAL
+  SICKNESS
+  WEDDING
+  BIRTH
+  ACCIDENT
+  OTHER
+}
+
+enum SocialPayoutStatus {
+  PENDING
+  APPROVED
+  PAID
+  REJECTED
+  CANCELLED
+}
+
+enum PayoutMode {
+  /// Classic ikimina: savings, loans, share-out at cycle end
+  SAVINGS_AND_LOANS
+  /// Tontine / ROSCA: each period's pot goes to one member in turn
+  ROTATING
+}
+
+enum RotationSlotStatus {
+  UPCOMING
+  PAID
+  SKIPPED
+}
+
+enum SwapRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
 }
 
 enum GroupVerificationStatus {
@@ -44,6 +140,7 @@ enum FineType {
   LATE_CONTRIBUTION
   LATE_LOAN
   ABSENCE
+  LATE_ARRIVAL
   MISCONDUCT
   OTHER
 }
@@ -165,6 +262,50 @@ enum NotificationType {
   GROUP_VERIFIED
   /// Group verification rejected by a super admin
   GROUP_VERIFICATION_REJECTED
+  /// Expense recorded and waiting for the other leader's approval
+  EXPENSE_SUBMITTED
+  EXPENSE_APPROVED
+  EXPENSE_REJECTED
+  /// Social fund (ingoboka) payout requested / decided / paid
+  SOCIAL_PAYOUT_REQUESTED
+  SOCIAL_PAYOUT_APPROVED
+  SOCIAL_PAYOUT_REJECTED
+  SOCIAL_PAYOUT_PAID
+  /// Share-out prepared (admin must approve) / cycle closed / member paid
+  SHARE_OUT_PREPARED
+  CYCLE_CLOSED
+  SHARE_OUT_PAID
+  /// Rotating payout made / swap requested / swap answered
+  ROTATION_PAYOUT_PAID
+  ROTATION_SWAP_REQUESTED
+  ROTATION_SWAP_RESPONDED
+  /// Manual ledger adjustment recorded (audit for the other leader)
+  LEDGER_ADJUSTMENT
+  ROLE_CHANGED
+  JOIN_REQUESTED
+  JOIN_APPROVED
+  JOIN_REJECTED
+  EXIT_REQUESTED
+  EXIT_SETTLED
+  EXIT_REJECTED
+  MEETING_SCHEDULED
+  MEETING_CANCELLED
+  MEETING_MINUTES_PUBLISHED
+  CONSTITUTION_PUBLISHED
+  POLL_OPENED
+  POLL_CLOSED
+  GUARANTOR_REQUESTED
+  GUARANTOR_RESPONDED
+  GUARANTEE_CALLED
+  LOAN_INSTALLMENT_DUE
+  LOAN_INSTALLMENT_LATE
+  LOAN_APPLICATION_CANCELLED
+  /// Group admin broadcast to all members (msfts §7)
+  GROUP_ANNOUNCEMENT
+  /// Removed from / suspended in a group (replaces GroupRemovalNotification)
+  REMOVED_FROM_GROUP
+  SUSPENDED_IN_GROUP
+  MEMBERSHIP_REACTIVATED
 }
 
 enum NotificationAudience {
@@ -203,6 +344,35 @@ model User {
   emailVerificationExpiresAt DateTime?
   passwordResetOtpHash       String?
   passwordResetExpiresAt     DateTime?
+  /// Platform suspension by a super admin (msfts §6): login and every session are refused.
+  suspendedAt                DateTime?
+  suspendedById              String?
+  suspensionReason           String?
+  /// Brute-force lockout: consecutive failed logins; `lockedUntil` blocks sign-in until then.
+  failedLoginAttempts        Int       @default(0)
+  lockedUntil                DateTime?
+  lastLoginAt                DateTime?
+  /// Bumped to revoke every issued token (reset access, suspension, password change).
+  sessionVersion             Int       @default(0)
+  // Account & security (msfts §8)
+  /// Canonical phone digits (e.g. 250788123456); unique so people can sign in by phone.
+  phoneKey                   String?   @unique
+  phoneVerifiedAt            DateTime?
+  /// One-time SMS code for phone login / phone verification / SMS two-step.
+  phoneOtpHash               String?
+  phoneOtpExpiresAt          DateTime?
+  phoneOtpPurpose            String?
+  /// Wrong one-time codes since the last code was issued (5 = code invalidated).
+  otpFailedAttempts          Int       @default(0)
+  passwordChangedAt          DateTime?
+  twoFactorMethod            TwoFactorMethod?
+  twoFactorEnabledAt         DateTime?
+  totpSecretEnc              String?
+  totpPendingSecretEnc       String?
+  /// Last accepted TOTP time step (replay protection).
+  totpLastStep               Int?
+  /// SHA-256 hashes of unused recovery codes.
+  twoFactorRecoveryCodes     String[]  @default([])
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -211,7 +381,6 @@ model User {
   createdGroups Group[]            @relation("GroupCreator")
   treasurerInvitations TreasurerInvitation[]
   memberInvitations    MemberInvitation[]
-  groupRemovalNotifications GroupRemovalNotification[]
   userNotifications     UserNotification[]
   contributions Contribution[]
   loanApplications  LoanApplication[]
@@ -222,6 +391,10 @@ model User {
   depositRecords      DepositRecord[]
   depositReviews    DepositRecord[] @relation("DepositReviewedBy")
   fines             Fine[]
+  notificationPreferences NotificationPreference[]
+  refreshTokens           RefreshToken[]
+  deletionRequests        AccountDeletionRequest[]
+  pushSubscriptions       PushSubscription[]
 
   @@map("users")
 }
@@ -248,7 +421,26 @@ model Group {
   deletedById    String?
   deletionReason String?
 
-  minMembers  Int
+  /// Member cap (join / invite refused at this many active members).
+  maxMembers  Int
+  /// Active members needed before the group can ask for verification.
+  minMembers  Int      @default(2)
+
+  // Governance (msfts §3)
+  /// Public-group join requests wait for a group admin.
+  joinRequiresApproval         Boolean  @default(true)
+  /// Distinct leader approvals needed for a loan (capped at the leaders available).
+  loanApprovalsRequired        Int      @default(2)
+  /// Loans also need at least one group admin and one treasurer among the approvers.
+  loanRequireAdminAndTreasurer Boolean  @default(true)
+  /// Distinct leader approvals needed for an expense (besides the one who recorded it).
+  expenseApprovalsRequired     Int      @default(1)
+  /// Members must accept the current constitution before applying for loans.
+  constitutionRequired         Boolean  @default(false)
+  /// Default meeting fines (a meeting may override them).
+  defaultAbsenceFine           Decimal? @db.Decimal(14, 2)
+  defaultLateArrivalFine       Decimal? @db.Decimal(14, 2)
+
   createdAt   DateTime @default(now())
 
   createdBy  User         @relation("GroupCreator", fields: [createdById], references: [id])
@@ -265,6 +457,20 @@ model Group {
   userNotifications    UserNotification[]
   fines                Fine[]
   loanDisbursements    LoanDisbursement[]
+  ledgerEntries        LedgerEntry[]
+  cycles               GroupCycle[]
+  expenses             Expense[]
+  socialFundConfig     SocialFundConfig?
+  socialPayouts        SocialPayout[]
+  rotationSlots        RotationSlot[]
+  approvals            Approval[]
+  exitRequests         ExitRequest[]
+  meetings             Meeting[]
+  constitutions        GroupConstitution[]
+  polls                Poll[]
+  memberProfiles       GroupMemberProfile[]
+  paymentAccount       GroupPaymentAccount?
+  announcements        GroupAnnouncement[]
 
   @@index([createdById])
   @@index([verificationStatus])
@@ -277,13 +483,17 @@ model Contribution {
   userId    String
   groupId   String
 
-  amount    Decimal  @db.Decimal(10, 2)
+  amount    Decimal  @db.Decimal(14, 2)
   /// Money allocated so far (partial payments); equals `amount` when PAID.
-  amountPaid Decimal @default(0) @db.Decimal(10, 2)
+  amountPaid Decimal @default(0) @db.Decimal(14, 2)
   dueDate   DateTime
   paidAt    DateTime?
 
   status    ContributionStatus @default(PENDING)
+  /// Which pot this period feeds (savings or social fund).
+  fund      FundType @default(SAVINGS)
+  /// Savings cycle (by dueDate), null when the group runs no cycles.
+  cycleId   String?
   /// Set by the scheduler when the row turns LATE.
   lateMarkedAt   DateTime?
   /// Set when the "due soon" reminder was sent (dedupe).
@@ -296,9 +506,10 @@ model Contribution {
   fine        Fine?
   allocations DepositAllocation[]
 
-  @@unique([userId, groupId, dueDate])
+  @@unique([userId, groupId, fund, dueDate])
   @@index([groupId, dueDate])
   @@index([groupId, status, dueDate])
+  @@index([cycleId])
 
   @@map("contributions")
 }
@@ -310,8 +521,8 @@ model Fine {
   groupId        String
   userId         String
   type           FineType
-  amount         Decimal    @db.Decimal(10, 2)
-  amountPaid     Decimal    @default(0) @db.Decimal(10, 2)
+  amount         Decimal    @db.Decimal(14, 2)
+  amountPaid     Decimal    @default(0) @db.Decimal(14, 2)
   currency       String     @default("RWF")
   reason         String
   status         FineStatus @default(OPEN)
@@ -324,6 +535,7 @@ model Fine {
   waivedReason   String?
   waivedAt       DateTime?
   paidAt         DateTime?
+  cycleId        String?
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
 
@@ -343,7 +555,7 @@ model DepositAllocation {
   id             String         @id @default(cuid())
   depositId      String
   kind           AllocationKind
-  amount         Decimal        @db.Decimal(10, 2)
+  amount         Decimal        @db.Decimal(14, 2)
   contributionId String?
   fineId         String?
   memberLoanId   String?
@@ -365,7 +577,7 @@ model ContributionConfig {
   id        String @id @default(cuid())
   groupId   String @unique
 
-  amount    Decimal @db.Decimal(10, 2)
+  amount    Decimal @db.Decimal(14, 2)
   currency  String  @default("RWF")
 
   interval  ContributionInterval
@@ -381,6 +593,8 @@ model ContributionConfig {
   gracePeriodDays      Int @default(0)
   /// In-app reminder this many days before each due date (0 = off).
   reminderDaysBefore   Int @default(1)
+  /// Classic savings & loans, or rotating payouts (tontine).
+  payoutMode           PayoutMode @default(SAVINGS_AND_LOANS)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -440,7 +654,11 @@ model UserGroup {
   roleId             String
   joinedAt           DateTime               @default(now())
   membershipStatus   GroupMembershipStatus  @default(ACTIVE)
-  customContributionAmount Decimal? @db.Decimal(10,2)
+  /// When a join request was made (PENDING_APPROVAL) and its message.
+  joinRequestedAt    DateTime?
+  joinMessage        String?
+  exitedAt           DateTime?
+  customContributionAmount Decimal? @db.Decimal(14, 2)
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -454,22 +672,6 @@ model UserGroup {
 }
 
 /// In-app notice when a user is removed or suspended from a group (platform login unaffected).
-model GroupRemovalNotification {
-  id        String           @id @default(cuid())
-  userId    String
-  groupId   String
-  groupName String
-  kind      GroupRemovalKind
-  reason    String
-  readAt    DateTime?
-  createdAt DateTime         @default(now())
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, readAt])
-  @@map("group_removal_notifications")
-}
-
 /// Per-user in-app notification (one row per recipient).
 model UserNotification {
   id        String   @id @default(cuid())
@@ -482,6 +684,8 @@ model UserNotification {
   metadata  Json?
   readAt    DateTime?
   createdAt DateTime @default(now())
+  /// Channels this notification also went out on (email / SMS / push).
+  deliveredVia NotificationChannel[] @default([])
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   group Group? @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -528,6 +732,16 @@ model LoanConfig {
   defaultAfterDays        Int?
   /// Refuse new loan applications while the member has LATE contributions or open fines.
   blockIfArrears          Boolean  @default(true)
+  /// FLAT: interest on the original principal · REDUCING: on the remaining balance (amortized).
+  interestMethod          InterestMethod      @default(FLAT)
+  /// SINGLE = one repayment at the end of the term.
+  installmentInterval     InstallmentInterval @default(SINGLE)
+  /// Accepted guarantors a loan needs before it can be disbursed (0 = none).
+  guarantorsRequired      Int      @default(0)
+  /// Borrowers with an ACTIVE loan may top it up (new loan refinances the old one).
+  allowTopUp              Boolean  @default(false)
+  /// % of the not-yet-due interest waived when a loan is repaid in full early.
+  earlyRepaymentRebatePercent Int  @default(0)
 
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
@@ -543,12 +757,16 @@ model LoanApplication {
   id                          String                 @id @default(cuid())
   userId                      String
   groupId                     String
-  requestedAmount             Decimal                @db.Decimal(10, 2)
+  requestedAmount             Decimal                @db.Decimal(14, 2)
+  /// Group currency when the request was made (msfts §10).
+  currency                    String                 @default("RWF")
+  /// Client key: a retried submit returns the same application (msfts §10).
+  idempotencyKey              String?                @unique
   status                      LoanApplicationStatus  @default(PENDING)
   interestRateSnapshot        Decimal                @db.Decimal(5, 2)
   repaymentPeriodDaysSnapshot Int
   /// Max allowed at request time (audit / explain eligibility).
-  maxAmountSnapshot           Decimal?               @db.Decimal(10, 2)
+  maxAmountSnapshot           Decimal?               @db.Decimal(14, 2)
   /// Group admin approval slot (separate from treasurer; both required).
   groupAdminApprovedAt        DateTime?
   groupAdminApprovedById      String?
@@ -558,6 +776,14 @@ model LoanApplication {
   rejectionReason             String?
   rejectedAt                  DateTime?
   rejectedByUserId            String?
+  /// What the money is for, and supporting documents (URLs).
+  purpose                     String?
+  attachmentUrls              Json?
+  interestMethodSnapshot      InterestMethod      @default(FLAT)
+  installmentIntervalSnapshot InstallmentInterval @default(SINGLE)
+  /// Top-up: the ACTIVE loan this application refinances.
+  topUpOfLoanId               String?
+  cancelledAt                 DateTime?
   createdAt                   DateTime               @default(now())
   updatedAt                   DateTime               @updatedAt
 
@@ -567,6 +793,7 @@ model LoanApplication {
   treasurerApprovedBy  User? @relation("LoanAppTreasurer", fields: [treasurerApprovedById], references: [id], onDelete: SetNull)
   rejectedBy           User? @relation("LoanAppRejectedBy", fields: [rejectedByUserId], references: [id], onDelete: SetNull)
   memberLoan            MemberLoan?
+  guarantors            LoanGuarantor[]
 
   @@index([groupId, userId])
   @@index([userId, status])
@@ -580,10 +807,10 @@ model MemberLoan {
   groupId                     String
   applicationId               String   @unique
   /// Principal disbursed to the member.
-  principalAmount             Decimal  @db.Decimal(10, 2)
+  principalAmount             Decimal  @db.Decimal(14, 2)
   /// Total to repay = principal + interest (flat, from snapshots at approval).
-  totalRepayable              Decimal  @db.Decimal(10, 2)
-  amountRepaid                Decimal  @default(0) @db.Decimal(10, 2)
+  totalRepayable              Decimal  @db.Decimal(14, 2)
+  amountRepaid                Decimal  @default(0) @db.Decimal(14, 2)
   currency                    String   @default("RWF")
   interestRateSnapshot        Decimal  @db.Decimal(5, 2)
   repaymentPeriodDaysSnapshot Int
@@ -591,7 +818,7 @@ model MemberLoan {
   dueDate                     DateTime
   status                      MemberLoanStatus @default(ACTIVE)
   /// Late penalty bucket, increased by the daily job (see `LoanConfig.penaltyRate`); paid first.
-  penaltyAccrued              Decimal  @default(0) @db.Decimal(10, 2)
+  penaltyAccrued              Decimal  @default(0) @db.Decimal(14, 2)
   /// Number of overdue penalty periods already charged (idempotent accrual).
   penaltyPeriodsApplied       Int      @default(0)
   lastPenaltyAt               DateTime?
@@ -601,7 +828,16 @@ model MemberLoan {
   writtenOffAt                DateTime?
   writtenOffById              String?
   writeOffReason              String?
-  writtenOffAmount            Decimal? @db.Decimal(10, 2)
+  writtenOffAmount            Decimal? @db.Decimal(14, 2)
+  /// Savings cycle in which the loan was disbursed.
+  cycleId                     String?
+  interestMethodSnapshot      InterestMethod      @default(FLAT)
+  installmentIntervalSnapshot InstallmentInterval @default(SINGLE)
+  /// Interest waived for early full repayment.
+  rebateGranted               Decimal  @default(0) @db.Decimal(14, 2)
+  /// Set on a loan that was refinanced by a top-up (points to the new loan).
+  refinancedByLoanId          String?
+  topUpOfLoanId               String?
   createdAt                   DateTime @default(now())
   updatedAt                   DateTime @updatedAt
 
@@ -612,6 +848,8 @@ model MemberLoan {
   disbursement   LoanDisbursement?
   allocations    DepositAllocation[]
   fines          Fine[]
+  installments   LoanInstallment[]
+  guarantors     LoanGuarantor[]
 
   @@index([groupId, userId, status])
   @@index([status, dueDate])
@@ -623,7 +861,7 @@ model LoanDisbursement {
   id                    String                 @id @default(cuid())
   memberLoanId          String                 @unique
   groupId               String
-  amount                Decimal                @db.Decimal(10, 2)
+  amount                Decimal                @db.Decimal(14, 2)
   currency              String                 @default("RWF")
   method                LoanDisbursementMethod
   status                LoanDisbursementStatus @default(PENDING)
@@ -652,11 +890,11 @@ model DepositRecord {
   id                    String                 @id @default(cuid())
   userId                String
   groupId               String
-  amount                Decimal                @db.Decimal(10, 2)
+  amount                Decimal                @db.Decimal(14, 2)
   currency              String                 @default("RWF")
-  contributionPortion   Decimal              @db.Decimal(10, 2)
-  finePortion           Decimal                @default(0) @db.Decimal(10, 2)
-  installmentPortion    Decimal                @default(0) @db.Decimal(10, 2)
+  contributionPortion   Decimal              @db.Decimal(14, 2)
+  finePortion           Decimal                @default(0) @db.Decimal(14, 2)
+  installmentPortion    Decimal                @default(0) @db.Decimal(14, 2)
   paymentMethod         DepositPaymentMethod
   phone                 String?
   status                DepositRecordStatus    @default(PENDING)
@@ -673,9 +911,13 @@ model DepositRecord {
   providerTransactionId String?
   providerStatus        String?
   providerPayload       Json?
+  /// Loan repayment asking for the early-payoff rebate (applied if it clears the loan).
+  earlyPayoff           Boolean                @default(false)
   /// Client-supplied key; a retry with the same key returns the same deposit.
   idempotencyKey        String?                @unique
   failureReason         String?
+  /// Platform fee charged on top of `amount` (MoMo only); never enters the group's books.
+  platformFee           Decimal                @default(0) @db.Decimal(14, 2)
 
   /// Loan this payment targets (LOAN_REPAYMENT, or COMBINED when the member has an open loan).
   memberLoanId String?
@@ -690,4 +932,847 @@ model DepositRecord {
   @@index([groupId, userId])
   @@index([memberLoanId])
   @@map("deposit_records")
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Group accounting (msfts §2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cash book: one row per money movement in or out of a group fund.
+/// Balance of a fund = Σ IN − Σ OUT. `sourceKey` makes every writer idempotent.
+model LedgerEntry {
+  id             String          @id @default(cuid())
+  groupId        String
+  cycleId        String?
+  /// Member concerned, if any.
+  userId         String?
+  fund           FundType        @default(SAVINGS)
+  type           LedgerEntryType
+  direction      LedgerDirection
+  amount         Decimal         @db.Decimal(14, 2)
+  /// e.g. "alloc:<id>:principal", "disb:<id>", "expense:<id>" (unique per movement).
+  sourceKey      String          @unique
+  depositId      String?
+  allocationId   String?
+  contributionId String?
+  fineId         String?
+  memberLoanId   String?
+  disbursementId String?
+  expenseId      String?
+  socialPayoutId String?
+  shareOutId     String?
+  rotationSlotId String?
+  description    String?
+  createdById    String?
+  occurredAt     DateTime
+  createdAt      DateTime        @default(now())
+
+  group Group       @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  cycle GroupCycle? @relation(fields: [cycleId], references: [id], onDelete: SetNull)
+
+  @@index([groupId, occurredAt])
+  @@index([groupId, fund, type])
+  @@index([groupId, cycleId, type])
+  @@index([groupId, userId])
+  @@map("ledger_entries")
+}
+
+/// Savings cycle (often 12 months) ending with a share-out.
+model GroupCycle {
+  id             String      @id @default(cuid())
+  groupId        String
+  name           String
+  startDate      DateTime
+  endDate        DateTime
+  status         CycleStatus @default(ACTIVE)
+  preparedAt     DateTime?
+  preparedById   String?
+  closedAt       DateTime?
+  closedById     String?
+  /// Snapshot of the share-out totals at closing (profit, cash, expenses).
+  closingSummary Json?
+  notes          String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  group         Group         @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  shareOuts     ShareOut[]
+  ledgerEntries LedgerEntry[]
+
+  @@index([groupId, status])
+  @@index([groupId, startDate])
+  @@map("group_cycles")
+}
+
+/// One member share-out at the end of a cycle.
+model ShareOut {
+  id             String         @id @default(cuid())
+  cycleId        String
+  groupId        String
+  userId         String
+  /// Opening balance carried over from the previous cycle.
+  openingBalance Decimal        @db.Decimal(14, 2)
+  savings        Decimal        @db.Decimal(14, 2)
+  profitShare    Decimal        @db.Decimal(14, 2)
+  grossAmount    Decimal        @db.Decimal(14, 2)
+  fineDeduction  Decimal        @db.Decimal(14, 2)
+  loanDeduction  Decimal        @db.Decimal(14, 2)
+  /// Debt that the share could not cover (stays open).
+  uncoveredDebt  Decimal        @db.Decimal(14, 2)
+  netPayout      Decimal        @db.Decimal(14, 2)
+  status         ShareOutStatus @default(PENDING)
+  method         String?
+  reference      String?
+  paidAt         DateTime?
+  paidById       String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  cycle GroupCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+
+  @@unique([cycleId, userId])
+  @@index([groupId, status])
+  @@map("share_outs")
+}
+
+/// Group spending (bank fees, meetings). Recorded by one leader, approved by another.
+model Expense {
+  id              String          @id @default(cuid())
+  groupId         String
+  cycleId         String?
+  fund            FundType        @default(SAVINGS)
+  amount          Decimal         @db.Decimal(12, 2)
+  category        ExpenseCategory
+  description     String
+  receiptUrl      String?
+  status          ExpenseStatus   @default(PENDING)
+  requestedById   String
+  approvedById    String?
+  approvedAt      DateTime?
+  rejectedById    String?
+  rejectionReason String?
+  occurredAt      DateTime
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, status])
+  @@index([groupId, occurredAt])
+  @@map("expenses")
+}
+
+/// Rules of the social / emergency fund (ingoboka). Generates SOCIAL contribution periods.
+model SocialFundConfig {
+  id                 String               @id @default(cuid())
+  groupId            String               @unique
+  amount             Decimal              @db.Decimal(14, 2)
+  currency           String               @default("RWF")
+  interval           ContributionInterval
+  startDate          DateTime
+  dayOfWeek          Int?
+  dayOfMonth         Int?
+  gracePeriodDays    Int                  @default(0)
+  latePenaltyRate    Decimal?             @db.Decimal(5, 2)
+  reminderDaysBefore Int                  @default(1)
+  /// Cap per payout (null = no cap).
+  maxPayoutAmount    Decimal?             @db.Decimal(12, 2)
+  isActive           Boolean              @default(true)
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@map("social_fund_config")
+}
+
+/// Emergency payout from the social fund (funeral, sickness).
+model SocialPayout {
+  id                String             @id @default(cuid())
+  groupId           String
+  cycleId           String?
+  beneficiaryUserId String
+  amount            Decimal            @db.Decimal(12, 2)
+  reason            SocialPayoutReason
+  description       String
+  status            SocialPayoutStatus @default(PENDING)
+  requestedById     String
+  approvedById      String?
+  approvedAt        DateTime?
+  rejectedById      String?
+  rejectionReason   String?
+  paidById          String?
+  paidAt            DateTime?
+  method            String?
+  reference         String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, status])
+  @@map("social_payouts")
+}
+
+/// Rotating payout (tontine): who receives the pot on each due date.
+model RotationSlot {
+  id              String             @id @default(cuid())
+  groupId         String
+  cycleId         String?
+  position        Int
+  dueDate         DateTime
+  recipientUserId String
+  expectedAmount  Decimal            @db.Decimal(12, 2)
+  status          RotationSlotStatus @default(UPCOMING)
+  paidAmount      Decimal?           @db.Decimal(12, 2)
+  paidAt          DateTime?
+  paidById        String?
+  method          String?
+  reference       String?
+  skipReason      String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, dueDate])
+  @@index([groupId, status])
+  @@map("rotation_slots")
+}
+
+/// Request to swap two upcoming rotation slots (the other recipient must accept).
+model RotationSwapRequest {
+  id            String            @id @default(cuid())
+  groupId       String
+  fromSlotId    String
+  toSlotId      String
+  requestedById String
+  targetUserId  String
+  status        SwapRequestStatus @default(PENDING)
+  respondedAt   DateTime?
+  createdAt     DateTime          @default(now())
+
+  @@index([groupId, status])
+  @@index([targetUserId, status])
+  @@map("rotation_swap_requests")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Members and governance (msfts §3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ApprovalEntityType {
+  LOAN_APPLICATION
+  EXPENSE
+}
+
+enum ExitKind {
+  /// Member asked to leave
+  VOLUNTARY
+  /// Removed by the admin or by a group vote
+  REMOVED
+}
+
+enum ExitRequestStatus {
+  PENDING
+  SETTLED
+  REJECTED
+  CANCELLED
+}
+
+enum MeetingStatus {
+  SCHEDULED
+  HELD
+  CANCELLED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  EXCUSED
+}
+
+enum PollKind {
+  /// Free question with custom options
+  GENERAL
+  /// YES/NO: give a member a new role (executed when passed)
+  ROLE_CHANGE
+  /// YES/NO: remove a member (executed when passed)
+  REMOVE_MEMBER
+  /// YES/NO on a rule change (recorded, applied by the admin)
+  RULE_CHANGE
+}
+
+enum PollStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+/// One leader sign-off on a loan application or an expense (co-signers).
+model Approval {
+  id         String             @id @default(cuid())
+  groupId    String
+  entityType ApprovalEntityType
+  entityId   String
+  userId     String
+  role       RoleName
+  createdAt  DateTime           @default(now())
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([entityType, entityId, userId])
+  @@index([groupId, entityType, entityId])
+  @@map("approvals")
+}
+
+/// Leaving the group: refund of savings minus debts.
+model ExitRequest {
+  id              String            @id @default(cuid())
+  groupId         String
+  userId          String
+  kind            ExitKind
+  status          ExitRequestStatus @default(PENDING)
+  reason          String
+  requestedById   String
+  /// Filled at settlement.
+  savingsBase     Decimal?          @db.Decimal(14, 2)
+  fineDeduction   Decimal?          @db.Decimal(14, 2)
+  loanDeduction   Decimal?          @db.Decimal(14, 2)
+  uncoveredDebt   Decimal?          @db.Decimal(14, 2)
+  refundAmount    Decimal?          @db.Decimal(14, 2)
+  method          String?
+  reference       String?
+  settledById     String?
+  settledAt       DateTime?
+  decidedById     String?
+  rejectionReason String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, status])
+  @@index([userId, status])
+  @@map("exit_requests")
+}
+
+model Meeting {
+  id              String        @id @default(cuid())
+  groupId         String
+  title           String
+  scheduledAt     DateTime
+  location        String?
+  agenda          String?
+  status          MeetingStatus @default(SCHEDULED)
+  minutesText     String?
+  minutesUrl      String?
+  /// Overrides the group defaults when set.
+  absenceFine     Decimal?      @db.Decimal(14, 2)
+  lateFine        Decimal?      @db.Decimal(14, 2)
+  createdById     String
+  heldAt          DateTime?
+  finesIssuedAt   DateTime?
+  cancelledReason String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  group      Group               @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  attendance MeetingAttendance[]
+
+  @@index([groupId, scheduledAt])
+  @@map("meetings")
+}
+
+model MeetingAttendance {
+  id           String           @id @default(cuid())
+  meetingId    String
+  userId       String
+  status       AttendanceStatus
+  note         String?
+  /// Fine issued for ABSENT / LATE (once).
+  fineId       String?
+  recordedById String
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  @@unique([meetingId, userId])
+  @@map("meeting_attendance")
+}
+
+/// Group bylaws, versioned. Members accept the current version.
+model GroupConstitution {
+  id               String   @id @default(cuid())
+  groupId          String
+  version          Int
+  title            String
+  content          String
+  documentUrl      String?
+  summaryOfChanges String?
+  publishedById    String
+  createdAt        DateTime @default(now())
+
+  group       Group                    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  acceptances ConstitutionAcceptance[]
+
+  @@unique([groupId, version])
+  @@map("group_constitutions")
+}
+
+model ConstitutionAcceptance {
+  id             String   @id @default(cuid())
+  constitutionId String
+  userId         String
+  acceptedAt     DateTime @default(now())
+
+  constitution GroupConstitution @relation(fields: [constitutionId], references: [id], onDelete: Cascade)
+
+  @@unique([constitutionId, userId])
+  @@map("constitution_acceptances")
+}
+
+model Poll {
+  id             String     @id @default(cuid())
+  groupId        String
+  title          String
+  description    String?
+  kind           PollKind
+  /// ROLE_CHANGE: { userId, role } · REMOVE_MEMBER: { userId, reason }
+  payload        Json?
+  /// Option labels (YES/NO for action polls).
+  options        Json
+  status         PollStatus @default(OPEN)
+  /// Hide who voted for what (counts are always visible).
+  anonymous      Boolean    @default(true)
+  /// % of active members who must vote for the result to count.
+  quorumPercent  Int        @default(50)
+  /// YES must exceed this % of votes cast (action polls).
+  passPercent    Int        @default(50)
+  closesAt       DateTime
+  createdById    String
+  closedAt       DateTime?
+  closedById     String?
+  result         Json?
+  executedAt     DateTime?
+  executionError String?
+  createdAt      DateTime   @default(now())
+
+  group Group      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  votes PollVote[]
+
+  @@index([groupId, status])
+  @@index([status, closesAt])
+  @@map("polls")
+}
+
+model PollVote {
+  id          String   @id @default(cuid())
+  pollId      String
+  userId      String
+  optionIndex Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  poll Poll @relation(fields: [pollId], references: [id], onDelete: Cascade)
+
+  @@unique([pollId, userId])
+  @@map("poll_votes")
+}
+
+/// Member details kept by the group (ID, address, next of kin / beneficiary).
+model GroupMemberProfile {
+  id                      String    @id @default(cuid())
+  groupId                 String
+  userId                  String
+  nationalId              String?
+  dateOfBirth             DateTime?
+  gender                  String?
+  address                 String?
+  occupation              String?
+  nextOfKinName           String?
+  nextOfKinPhone          String?
+  nextOfKinRelationship   String?
+  beneficiaryName         String?
+  beneficiaryPhone        String?
+  beneficiaryRelationship String?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@map("group_member_profiles")
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Loans (msfts §4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum InterestMethod {
+  FLAT
+  REDUCING
+}
+
+enum InstallmentInterval {
+  SINGLE
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum InstallmentStatus {
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  LATE
+}
+
+enum GuarantorStatus {
+  REQUESTED
+  ACCEPTED
+  DECLINED
+  /// Loan repaid / application closed: the guarantee no longer locks savings
+  RELEASED
+  /// Loan defaulted: the guarantor must pay their share
+  CALLED
+}
+
+/// One scheduled repayment of a loan. Payments fill installments oldest first.
+model LoanInstallment {
+  id                    String            @id @default(cuid())
+  memberLoanId          String
+  number                Int
+  dueDate               DateTime
+  principal             Decimal           @db.Decimal(14, 2)
+  interest              Decimal           @db.Decimal(14, 2)
+  amountPaid            Decimal           @default(0) @db.Decimal(14, 2)
+  status                InstallmentStatus @default(PENDING)
+  paidAt                DateTime?
+  /// Overdue penalty periods already charged for this installment.
+  penaltyPeriodsApplied Int               @default(0)
+  lateMarkedAt          DateTime?
+  reminderSentAt        DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  memberLoan MemberLoan @relation(fields: [memberLoanId], references: [id], onDelete: Cascade)
+
+  @@unique([memberLoanId, number])
+  @@index([status, dueDate])
+  @@map("loan_installments")
+}
+
+/// A member who backs a loan application with part of their savings.
+model LoanGuarantor {
+  id                String          @id @default(cuid())
+  groupId           String
+  loanApplicationId String
+  memberLoanId      String?
+  guarantorUserId   String
+  amountGuaranteed  Decimal         @db.Decimal(14, 2)
+  status            GuarantorStatus @default(REQUESTED)
+  respondedAt       DateTime?
+  calledAmount      Decimal?        @db.Decimal(14, 2)
+  calledAt          DateTime?
+  /// Paid by the guarantor towards the borrower loan after a call.
+  paidAmount        Decimal         @default(0) @db.Decimal(14, 2)
+  releasedAt        DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  application LoanApplication @relation(fields: [loanApplicationId], references: [id], onDelete: Cascade)
+  memberLoan  MemberLoan?     @relation(fields: [memberLoanId], references: [id], onDelete: SetNull)
+
+  @@unique([loanApplicationId, guarantorUserId])
+  @@index([groupId, guarantorUserId, status])
+  @@map("loan_guarantors")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform / super admin (msfts §6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CollectionMode {
+  /// Every MoMo payment goes through the platform's collection account (env credentials).
+  PLATFORM
+  /// Groups with their own active payment account use it; others fall back to the platform.
+  PER_GROUP
+}
+
+enum PlatformFeeMode {
+  NONE
+  PERCENT
+  FLAT
+}
+
+/// Who did what, to which record, from where. Written for every successful change made
+/// through the API (plus failed logins and lockouts); before/after hold only changed fields.
+model AuditLog {
+  id             String   @id @default(cuid())
+  createdAt      DateTime @default(now())
+  actorId        String?
+  actorName      String?
+  actorRole      String?
+  /// Super admin behind a read-only impersonation session.
+  impersonatorId String?
+  action         String
+  method         String?
+  path           String?
+  entityType     String?
+  entityId       String?
+  groupId        String?
+  before         Json?
+  after          Json?
+  meta           Json?
+  ip             String?
+  userAgent      String?
+  /// HTTP status, or null for system events.
+  statusCode     Int?
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([groupId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+/// Single row (id = "platform").
+model PlatformSettings {
+  id                    String          @id @default("platform")
+  supportedCurrencies   String[]        @default(["RWF"])
+  defaultCurrency       String          @default("RWF")
+  collectionMode        CollectionMode  @default(PLATFORM)
+  /// Shown to members for manual transfers when the group has no account of its own.
+  platformAccountName   String?
+  platformAccountMsisdn String?
+  feeMode               PlatformFeeMode @default(NONE)
+  /// Percent (e.g. 1.5) or flat amount, per MoMo deposit.
+  feeValue              Decimal         @default(0) @db.Decimal(14, 2)
+  feeMin                Decimal?        @db.Decimal(14, 2)
+  feeMax                Decimal?        @db.Decimal(14, 2)
+  signupsEnabled        Boolean         @default(true)
+  /// Group admins and treasurers must turn on two-step verification before moving money.
+  requireLeaderTwoFactor Boolean        @default(false)
+  supportEmail          String?
+  /// Web push (VAPID) key pair, generated on first use; private key sealed.
+  vapidPublicKey        String?
+  vapidPrivateKeyEnc    String?
+  updatedAt             DateTime        @updatedAt
+  updatedById           String?
+
+  @@map("platform_settings")
+}
+
+/// A group's own MTN MoMo account. API secrets are AES-256-GCM encrypted and never returned.
+model GroupPaymentAccount {
+  id                             String   @id @default(cuid())
+  groupId                        String   @unique
+  provider                       String   @default("MTN_MOMO")
+  accountName                    String?
+  msisdn                         String?
+  collectionUserId               String?
+  collectionApiKeyEnc            String?
+  collectionSubscriptionKeyEnc   String?
+  disbursementUserId             String?
+  disbursementApiKeyEnc          String?
+  disbursementSubscriptionKeyEnc String?
+  isActive                       Boolean  @default(true)
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+  updatedById                    String?
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@map("group_payment_accounts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications and communication (msfts §7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+  PUSH
+}
+
+enum SmsStatus {
+  SENT
+  FAILED
+  SKIPPED
+}
+
+/// Per-user switch for one channel and one notification category (absent = default).
+model NotificationPreference {
+  id        String              @id @default(cuid())
+  userId    String
+  channel   NotificationChannel
+  category  String
+  enabled   Boolean
+  updatedAt DateTime            @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channel, category])
+  @@map("notification_preferences")
+}
+
+/// Every SMS attempt. One-time codes are stored masked.
+model SmsLog {
+  id                String    @id @default(cuid())
+  createdAt         DateTime  @default(now())
+  userId            String?
+  groupId           String?
+  to                String
+  message           String
+  /// NotificationType, OTP_VERIFY, OTP_RESET or TEST
+  kind              String
+  provider          String
+  status            SmsStatus
+  segments          Int       @default(1)
+  providerMessageId String?
+  error             String?
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([groupId, createdAt])
+  @@map("sms_logs")
+}
+
+/// Group admin broadcast to every active member.
+model GroupAnnouncement {
+  id         String                @id @default(cuid())
+  groupId    String
+  authorId   String
+  title      String
+  body       String
+  /// Channels besides in-app the author asked for (EMAIL / SMS / PUSH).
+  channels   NotificationChannel[] @default([])
+  pinned     Boolean               @default(false)
+  recipients Int                   @default(0)
+  createdAt  DateTime              @default(now())
+  deletedAt  DateTime?
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@map("group_announcements")
+}
+
+/// Browser push subscription (Web Push / VAPID).
+model PushSubscription {
+  id         String    @id @default(cuid())
+  userId     String
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  failures   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account and security (msfts §8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum TwoFactorMethod {
+  TOTP
+  SMS
+}
+
+enum DeletionRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// One signed-in device. The raw token lives only in an httpOnly cookie; we keep its hash.
+/// Rotated on every refresh; reusing a rotated token revokes the whole family.
+model RefreshToken {
+  id             String    @id @default(cuid())
+  userId         String
+  familyId       String
+  tokenHash      String    @unique
+  sessionVersion Int
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  revokedReason  String?
+  replacedById   String?
+  userAgent      String?
+  ip             String?
+  createdAt      DateTime  @default(now())
+  lastUsedAt     DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+/// Right-to-erasure request (Rwanda Law No. 058/2021); a super admin approves and the
+/// account is anonymised (financial records are kept as the law allows).
+model AccountDeletionRequest {
+  id           String                @id @default(cuid())
+  userId       String
+  reason       String?
+  status       DeletionRequestStatus @default(PENDING)
+  requestedAt  DateTime              @default(now())
+  decidedAt    DateTime?
+  decidedById  String?
+  decisionNote String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, requestedAt])
+  @@index([userId])
+  @@map("account_deletion_requests")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ops and quality (msfts §10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  DEAD
+}
+
+/// Durable background job (emails, SMS, MoMo status checks) with retries and backoff.
+/// Workers claim rows with FOR UPDATE SKIP LOCKED, so several API instances can share it.
+model Job {
+  id          String    @id @default(cuid())
+  type        String
+  payload     Json
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  runAt       DateTime  @default(now())
+  /// Only one PENDING/RUNNING job per key (e.g. one status check per deposit).
+  dedupeKey   String?
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  finishedAt  DateTime?
+
+  @@index([status, runAt])
+  @@index([type, status])
+  @@index([dedupeKey])
+  @@map("jobs")
 }

@@ -3,13 +3,23 @@ import { ConfigService } from '@nestjs/config';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { PrismaClientExceptionFilter } from './common/filters/prisma-client-exception.filter';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import {
+  AppLogger,
+  ErrorReporter,
+  requestContextMiddleware,
+} from './common/observability';
 import { appConfig } from './config/app.config';
+import { securityHeaders } from './common/rate-limit';
 
 type AppConfig = ReturnType<typeof appConfig>;
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const appLogger = new AppLogger();
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  app.useLogger(appLogger);
+  // Request id + access log first, so every later log line carries the id (msfts §10).
+  app.use(requestContextMiddleware(appLogger));
   const configService = app.get<ConfigService<AppConfig, true>>(ConfigService);
   const logger = new Logger('Bootstrap');
   const apiPrefix = configService.get('app.apiPrefix', { infer: true });
@@ -20,6 +30,28 @@ async function bootstrap() {
 
   app.setGlobalPrefix(apiPrefix);
 
+  // Security headers (msfts §8) and no framework fingerprint.
+  (
+    app.getHttpAdapter().getInstance() as { disable: (k: string) => void }
+  ).disable('x-powered-by');
+  app.use(securityHeaders);
+
+  // Behind a reverse proxy set TRUST_PROXY (e.g. `1` or `loopback`) so audit logs record the
+  // client IP from X-Forwarded-For instead of the proxy's.
+  const trustProxy = process.env.TRUST_PROXY?.trim();
+  if (trustProxy) {
+    const value = /^\d+$/.test(trustProxy)
+      ? Number(trustProxy)
+      : trustProxy === 'true'
+        ? true
+        : trustProxy;
+    (
+      app.getHttpAdapter().getInstance() as {
+        set: (k: string, v: unknown) => void;
+      }
+    ).set('trust proxy', value);
+  }
+
   const corsOrigins = process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',')
         .map((origin) => origin.trim())
@@ -29,7 +61,16 @@ async function bootstrap() {
   app.enableCors({
     origin: corsOrigins,
     methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Token-Transport',
+      'X-Request-Id',
+      'Idempotency-Key',
+    ],
+    exposedHeaders: ['Content-Disposition', 'Retry-After', 'X-Request-Id'],
+    // The refresh token travels in an httpOnly cookie.
+    credentials: true,
   });
 
   app.useGlobalPipes(
@@ -42,7 +83,13 @@ async function bootstrap() {
       },
     }),
   );
-  app.useGlobalFilters(new PrismaClientExceptionFilter());
+  app.useGlobalFilters(new AllExceptionsFilter());
+  process.on('unhandledRejection', (reason) => {
+    logger.error(
+      `Unhandled rejection: ${reason instanceof Error ? reason.stack : String(reason)}`,
+    );
+    ErrorReporter.capture(reason);
+  });
   app.enableShutdownHooks();
 
   if (swaggerEnabled) {

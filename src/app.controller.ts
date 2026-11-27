@@ -12,7 +12,7 @@ export class AppController {
   @ApiOkResponse({
     schema: {
       example: {
-        name: 'nest-app',
+        name: 'E-kimina API',
         version: '0.0.1',
         environment: 'development',
         docsPath: '/api/docs',

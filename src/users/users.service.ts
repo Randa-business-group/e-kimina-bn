@@ -13,6 +13,8 @@ const userSelect = {
   phoneNumber: true,
   image: true,
   emailVerified: true,
+  phoneVerifiedAt: true,
+  twoFactorMethod: true,
   createdAt: true,
   updatedAt: true,
 } satisfies Prisma.UserSelect;
@@ -53,6 +55,8 @@ export class UsersService {
     phoneNumber: string | null;
     image: string | null;
     emailVerified: boolean;
+    phoneVerifiedAt: Date | null;
+    twoFactorMethod: SafeUser['twoFactorMethod'];
     createdAt: Date;
     updatedAt: Date;
     platformRoles: { role: { name: RoleName } }[];
@@ -101,7 +105,8 @@ export class UsersService {
           image: input.image,
           emailVerified: input.emailVerified ?? true,
           emailVerificationOtpHash: input.emailVerificationOtpHash ?? undefined,
-          emailVerificationExpiresAt: input.emailVerificationExpiresAt ?? undefined,
+          emailVerificationExpiresAt:
+            input.emailVerificationExpiresAt ?? undefined,
           platformRoles: {
             create: {
               role: { connect: { name: RoleName.USER } },

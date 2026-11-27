@@ -12,7 +12,9 @@ import {
 
 /** Creates one scheduled / recorded contribution row. Admin or treasurer only. */
 export class CreateContributionDto {
-  @ApiProperty({ description: 'Member user id (must be an active member of the group)' })
+  @ApiProperty({
+    description: 'Member user id (must be an active member of the group)',
+  })
   @IsString()
   userId!: string;
 
@@ -22,11 +24,17 @@ export class CreateContributionDto {
   @Min(0.01)
   amount!: number;
 
-  @ApiProperty({ description: 'When this contribution is due (ISO 8601). Must be unique per member per group.' })
+  @ApiProperty({
+    description:
+      'When this contribution is due (ISO 8601). Must be unique per member per group.',
+  })
   @IsDateString()
   dueDate!: string;
 
-  @ApiPropertyOptional({ enum: ContributionStatus, default: ContributionStatus.PENDING })
+  @ApiPropertyOptional({
+    enum: ContributionStatus,
+    default: ContributionStatus.PENDING,
+  })
   @IsOptional()
   @IsEnum(ContributionStatus)
   status?: ContributionStatus;

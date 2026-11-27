@@ -18,9 +18,12 @@ export class UserLoansController {
 
   @Get()
   @ApiOperation({
-    summary: 'Your loan applications and active/completed member loans (all groups)',
+    summary:
+      'Your loan applications and active/completed member loans (all groups)',
   })
-  @ApiOkResponse({ description: 'Applications with dual-approval state + disbursed loans' })
+  @ApiOkResponse({
+    description: 'Applications with dual-approval state + disbursed loans',
+  })
   @ApiUnauthorizedResponse()
   getMyLoans(@CurrentUser() user: AuthenticatedUser) {
     return this.userFinance.getUserLoans(user.id);

@@ -10,6 +10,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { PlatformSettingsService } from '../platform/platform-settings.service';
 import { GroupsService } from '../groups/groups.service';
 import { ContributionScheduleService } from '../finance-core/contribution-schedule.service';
 import { UpsertContributionConfigDto } from './dto/upsert-contribution-config.dto';
@@ -24,6 +25,7 @@ export class ContributionConfigService {
     private readonly prisma: PrismaService,
     private readonly groupsService: GroupsService,
     private readonly schedule: ContributionScheduleService,
+    private readonly platform: PlatformSettingsService,
   ) {}
 
   /**
@@ -91,7 +93,7 @@ export class ContributionConfigService {
         ? new Prisma.Decimal(dto.latePenaltyRate)
         : null;
 
-    const currency = (dto.currency ?? 'RWF').trim() || 'RWF';
+    const currency = await this.platform.assertCurrency(dto.currency);
 
     const dayOfWeek = dto.dayOfWeek !== undefined ? dto.dayOfWeek : null;
     const dayOfMonth = dto.dayOfMonth !== undefined ? dto.dayOfMonth : null;
@@ -112,6 +114,7 @@ export class ContributionConfigService {
         ...(dto.reminderDaysBefore !== undefined
           ? { reminderDaysBefore: dto.reminderDaysBefore }
           : {}),
+        ...(dto.payoutMode ? { payoutMode: dto.payoutMode } : {}),
       },
       update: {
         amount: new Prisma.Decimal(dto.amount),
@@ -126,6 +129,7 @@ export class ContributionConfigService {
         ...(dto.reminderDaysBefore !== undefined
           ? { reminderDaysBefore: dto.reminderDaysBefore }
           : {}),
+        ...(dto.payoutMode ? { payoutMode: dto.payoutMode } : {}),
       },
     });
 
@@ -148,6 +152,7 @@ export class ContributionConfigService {
     latePenaltyRate: Prisma.Decimal | null;
     gracePeriodDays: number;
     reminderDaysBefore: number;
+    payoutMode: string;
     createdAt: Date;
     updatedAt: Date;
   }) {
@@ -167,6 +172,7 @@ export class ContributionConfigService {
           : decimalToNumber(config.latePenaltyRate),
       gracePeriodDays: config.gracePeriodDays,
       reminderDaysBefore: config.reminderDaysBefore,
+      payoutMode: config.payoutMode,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
     };

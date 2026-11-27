@@ -30,3 +30,22 @@ export function startOfUtcDay(d: Date): Date {
     Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()),
   );
 }
+
+/** The group's money currency (its contribution config), defaulting to RWF. */
+export async function groupCurrency(
+  db: {
+    contributionConfig: {
+      findUnique: (a: {
+        where: { groupId: string };
+        select: { currency: true };
+      }) => Promise<{ currency: string } | null>;
+    };
+  },
+  groupId: string,
+): Promise<string> {
+  const cc = await db.contributionConfig.findUnique({
+    where: { groupId },
+    select: { currency: true },
+  });
+  return cc?.currency ?? 'RWF';
+}

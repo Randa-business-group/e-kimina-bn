@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { FineStatus, FineType, LoanDisbursementMethod } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
+  IsBoolean,
   IsDateString,
   IsEnum,
   IsIn,
@@ -91,4 +92,8 @@ export class ManualDisbursementDto {
   @IsString()
   @MaxLength(2048)
   proofImageUrl?: string;
+}
+
+export class GuaranteeResponseDto {
+  @ApiProperty() @IsBoolean() accept!: boolean;
 }

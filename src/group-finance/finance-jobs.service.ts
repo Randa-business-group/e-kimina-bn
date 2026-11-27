@@ -8,6 +8,7 @@ import { ContributionScheduleService } from '../finance-core/contribution-schedu
 import { LoanPenaltyService } from '../finance-core/loan-penalty.service';
 import { GroupFinanceService } from './group-finance.service';
 import { GroupLoansService } from './group-loans.service';
+import { JobQueueService } from '../jobs/job-queue.service';
 
 function envInt(name: string, fallback: number): number {
   const n = Number(process.env[name]);
@@ -36,7 +37,15 @@ export class FinanceJobsService
     private readonly loanPenalties: LoanPenaltyService,
     private readonly groupFinance: GroupFinanceService,
     private readonly groupLoans: GroupLoansService,
-  ) {}
+    private readonly queue: JobQueueService,
+  ) {
+    this.queue.register('momo.refresh-deposit', async (p) => {
+      await this.groupFinance.refreshMomoDeposit(String(p.depositId));
+    });
+    this.queue.register('momo.refresh-payout', async (p) => {
+      await this.groupLoans.refreshDisbursement(String(p.disbursementId));
+    });
+  }
 
   onApplicationBootstrap() {
     if (
@@ -131,8 +140,21 @@ export class FinanceJobsService
     if (this.pollRunning) return;
     this.pollRunning = true;
     try {
-      await this.groupFinance.pollPendingMomoDeposits();
-      await this.groupLoans.pollPendingDisbursements();
+      // Each status check is a deduplicated job with retries (msfts §10).
+      await this.groupFinance.pollPendingMomoDeposits((id) =>
+        this.queue.enqueue(
+          'momo.refresh-deposit',
+          { depositId: id },
+          { dedupeKey: `momo:deposit:${id}`, maxAttempts: 3 },
+        ),
+      );
+      await this.groupLoans.pollPendingDisbursements((id) =>
+        this.queue.enqueue(
+          'momo.refresh-payout',
+          { disbursementId: id },
+          { dedupeKey: `momo:payout:${id}`, maxAttempts: 3 },
+        ),
+      );
     } catch (e) {
       this.logger.error(
         `MoMo polling failed: ${e instanceof Error ? e.message : String(e)}`,

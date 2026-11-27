@@ -5,6 +5,7 @@ import {
   Logger,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { PaymentAccountsService } from '../platform/payment-accounts.service';
 
 export type MomoMode = 'mock' | 'sandbox' | 'production' | 'disabled';
 export type MomoProduct = 'collection' | 'disbursement';
@@ -40,9 +41,12 @@ function env(name: string): string {
  */
 @Injectable()
 export class MomoService {
+  constructor(private readonly accounts: PaymentAccountsService) {}
+
   private readonly logger = new Logger(MomoService.name);
+  /** Keyed by product + API user (one token per credential set). */
   private readonly tokens = new Map<
-    MomoProduct,
+    string,
     { token: string; expiresAt: number }
   >();
   /** Mock mode: reference → result. */
@@ -108,8 +112,34 @@ export class MomoService {
       : null;
   }
 
-  private requireCreds(product: MomoProduct): ProductCreds {
-    const c = this.creds(product);
+  /**
+   * The group's own MoMo account when the platform runs in PER_GROUP mode and it is
+   * complete (msfts §6), otherwise the platform account from the environment.
+   */
+  private async resolveCreds(
+    product: MomoProduct,
+    groupId?: string,
+  ): Promise<ProductCreds | null> {
+    if (groupId) {
+      const own = await this.accounts.credsFor(groupId, product);
+      if (own) return own;
+    }
+    return this.creds(product);
+  }
+
+  /** Like isEnabled, but also counts a group's own account. */
+  async isEnabledFor(product: MomoProduct, groupId: string): Promise<boolean> {
+    const m = this.mode;
+    if (m === 'disabled') return false;
+    if (m === 'mock') return true;
+    return (await this.resolveCreds(product, groupId)) != null;
+  }
+
+  private async requireCreds(
+    product: MomoProduct,
+    groupId?: string,
+  ): Promise<ProductCreds> {
+    const c = await this.resolveCreds(product, groupId);
     if (!c) {
       throw new ServiceUnavailableException(
         `MTN MoMo ${product} is not configured on this server.`,
@@ -133,10 +163,10 @@ export class MomoService {
     return out;
   }
 
-  private async token(product: MomoProduct): Promise<string> {
-    const cached = this.tokens.get(product);
+  private async token(product: MomoProduct, c: ProductCreds): Promise<string> {
+    const cacheKey = `${product}:${c.userId}`;
+    const cached = this.tokens.get(cacheKey);
     if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
-    const c = this.requireCreds(product);
     const res = await fetch(`${this.baseUrl}/${product}/token/`, {
       method: 'POST',
       headers: {
@@ -153,17 +183,21 @@ export class MomoService {
       access_token: string;
       expires_in?: number;
     };
-    this.tokens.set(product, {
+    this.tokens.set(cacheKey, {
       token: body.access_token,
       expiresAt: Date.now() + (body.expires_in ?? 3600) * 1000,
     });
     return body.access_token;
   }
 
-  private async headers(product: MomoProduct, referenceId?: string) {
-    const c = this.requireCreds(product);
+  private async headers(
+    product: MomoProduct,
+    referenceId?: string,
+    groupId?: string,
+  ) {
+    const c = await this.requireCreds(product, groupId);
     const h: Record<string, string> = {
-      Authorization: `Bearer ${await this.token(product)}`,
+      Authorization: `Bearer ${await this.token(product, c)}`,
       'X-Target-Environment': this.targetEnvironment,
       'Ocp-Apim-Subscription-Key': c.subscriptionKey,
       'Content-Type': 'application/json',
@@ -184,9 +218,15 @@ export class MomoService {
       msisdn: string;
       payerMessage: string;
       payeeNote: string;
+      /** Use this group's own MoMo account when configured. */
+      groupId?: string;
     },
   ): Promise<void> {
-    if (!this.isEnabled(product)) {
+    if (
+      p.groupId
+        ? !(await this.isEnabledFor(product, p.groupId))
+        : !this.isEnabled(product)
+    ) {
       throw new ServiceUnavailableException(
         'MTN MoMo payments are not available right now.',
       );
@@ -209,7 +249,7 @@ export class MomoService {
     };
     const res = await fetch(`${this.baseUrl}/${product}/v1_0/${path}`, {
       method: 'POST',
-      headers: await this.headers(product, p.referenceId),
+      headers: await this.headers(product, p.referenceId, p.groupId),
       body: JSON.stringify(body),
     });
     if (res.status !== 202) {
@@ -225,6 +265,7 @@ export class MomoService {
     product: MomoProduct,
     path: 'requesttopay' | 'transfer',
     referenceId: string,
+    groupId?: string,
   ): Promise<MomoStatusResult> {
     if (this.isMock) {
       const status = this.mockLedger.get(referenceId) ?? 'SUCCESSFUL';
@@ -241,7 +282,7 @@ export class MomoService {
     const res = await fetch(
       `${this.baseUrl}/${product}/v1_0/${path}/${referenceId}`,
       {
-        headers: await this.headers(product),
+        headers: await this.headers(product, undefined, groupId),
       },
     );
     if (res.status === 404) {
@@ -284,15 +325,15 @@ export class MomoService {
     return this.send('collection', 'requesttopay', p);
   }
 
-  getRequestToPayStatus(referenceId: string) {
-    return this.status('collection', 'requesttopay', referenceId);
+  getRequestToPayStatus(referenceId: string, groupId?: string) {
+    return this.status('collection', 'requesttopay', referenceId, groupId);
   }
 
   transfer(p: Parameters<MomoService['send']>[2]) {
     return this.send('disbursement', 'transfer', p);
   }
 
-  getTransferStatus(referenceId: string) {
-    return this.status('disbursement', 'transfer', referenceId);
+  getTransferStatus(referenceId: string, groupId?: string) {
+    return this.status('disbursement', 'transfer', referenceId, groupId);
   }
 }

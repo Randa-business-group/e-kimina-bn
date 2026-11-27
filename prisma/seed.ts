@@ -137,7 +137,7 @@ async function main(): Promise<void> {
         createdById: groupAdminUser.id,
         isVerified: true,
         verificationStatus: 'VERIFIED',
-        minMembers: 100,
+        maxMembers: 100,
       },
     });
   }

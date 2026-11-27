@@ -5,6 +5,7 @@ import {
   DepositPurpose,
   DepositRecordStatus,
   FineStatus,
+  FundType,
   GroupMembershipStatus,
   LoanApplicationStatus,
   LoanDisbursementStatus,
@@ -16,6 +17,7 @@ import {
   PAYABLE_LOAN_STATUSES,
   loanBalances,
 } from '../finance-core/payment-allocation.service';
+import { scheduleSnapshot } from '../finance-core/loan-installments';
 import { PrismaService } from '../prisma/prisma.service';
 
 const METHOD_LABEL: Record<DepositPaymentMethod, string> = {
@@ -76,7 +78,8 @@ export class UserFinanceService {
           this.prisma.contributionConfig.findUnique({
             where: { groupId: m.group.id },
           }),
-          this.prisma.contribution.aggregate({
+          this.prisma.contribution.groupBy({
+            by: ['fund'],
             where: { userId, groupId: m.group.id },
             _sum: { amountPaid: true },
           }),
@@ -103,7 +106,15 @@ export class UserFinanceService {
         return {
           groupId: m.group.id,
           groupName: m.group.name,
-          totalContributed: roundMoney(decN(paid._sum.amountPaid)),
+          /** Savings only (loan stake, share-out base). */
+          totalContributed: roundMoney(
+            decN(
+              paid.find((p) => p.fund === FundType.SAVINGS)?._sum.amountPaid,
+            ),
+          ),
+          socialFundContributed: roundMoney(
+            decN(paid.find((p) => p.fund === FundType.SOCIAL)?._sum.amountPaid),
+          ),
           arrears: roundMoney(
             late.reduce((s, r) => s + decN(r.amount) - decN(r.amountPaid), 0),
           ),
@@ -404,19 +415,27 @@ export class UserFinanceService {
         continue;
       const { outstanding } = loanBalances(l);
       if (outstanding < EPS) continue;
+      // What is due now: penalty + overdue installments + the next one.
+      const snap = await scheduleSnapshot(this.prisma, l, now, 0);
+      const overdue = snap.overdueAmount > EPS;
+      const next = snap.nextInstallment;
       items.push({
         id: l.id,
         groupId: l.groupId,
         groupName: nameByGid.get(l.groupId) ?? 'Group',
         type: 'LOAN',
-        amount: outstanding,
+        amount: Math.min(outstanding, snap.dueNow),
         currency: l.currency,
-        dueDate: l.dueDate.toISOString(),
+        dueDate: next?.dueDate ?? l.dueDate.toISOString(),
         description:
           l.status === 'DEFAULTED'
             ? 'Loan in default — repay as soon as possible'
-            : `Loan balance due ${l.dueDate.toISOString().slice(0, 10)}`,
-        status: l.dueDate < now ? 'OVERDUE' : 'PENDING',
+            : overdue
+              ? `Loan installments overdue (${snap.overdueAmount.toFixed(0)}) + next installment`
+              : next
+                ? `Loan installment ${next.number} due ${next.dueDate.slice(0, 10)}`
+                : `Loan balance due ${l.dueDate.toISOString().slice(0, 10)}`,
+        status: overdue ? 'OVERDUE' : 'PENDING',
       });
     }
 
@@ -472,7 +491,7 @@ export class UserFinanceService {
           groupId: a.groupId,
           groupName: a.group.name,
           requestedAmount: decN(a.requestedAmount),
-          currency: 'RWF',
+          currency: a.currency,
           interestRate: decN(a.interestRateSnapshot),
           repaymentPeriodDays: a.repaymentPeriodDaysSnapshot,
           status: a.status,
@@ -523,6 +542,194 @@ export class UserFinanceService {
           disbursementMethod: l.disbursement?.method ?? null,
         };
       }),
+    };
+  }
+
+  /**
+   * Dashboard home (msfts §5 / §9): everything the landing page needs in one call — my groups,
+   * totals, what is due next, recent money movements, savings over the last 12 months and
+   * upcoming meetings.
+   */
+  async getDashboard(userId: string) {
+    const [user, memberships, summary, upcoming, history] = await Promise.all([
+      this.prisma.user.findUniqueOrThrow({
+        where: { id: userId },
+        select: { fullName: true, email: true },
+      }),
+      this.prisma.userGroup.findMany({
+        where: {
+          userId,
+          membershipStatus: GroupMembershipStatus.ACTIVE,
+          group: { deletedAt: null },
+        },
+        include: {
+          role: { select: { name: true } },
+          group: {
+            select: {
+              id: true,
+              name: true,
+              isVerified: true,
+              _count: {
+                select: {
+                  userGroups: {
+                    where: { membershipStatus: GroupMembershipStatus.ACTIVE },
+                  },
+                },
+              },
+            },
+          },
+        },
+        orderBy: { joinedAt: 'asc' },
+      }),
+      this.getSummary(userId),
+      this.getUpcoming(userId),
+      this.getHistory(userId, 1, 8),
+    ]);
+    const groupIds = memberships.map((m) => m.groupId);
+    const now = new Date();
+    const start = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1),
+    );
+    const monthly =
+      groupIds.length === 0
+        ? []
+        : await this.prisma.$queryRaw<{ m: Date; s: number }[]>(Prisma.sql`
+            SELECT date_trunc('month', COALESCE(d."reviewedAt", d."createdAt")) AS m, SUM(a.amount)::float AS s
+            FROM deposit_allocations a
+            JOIN deposit_records d ON d.id = a."depositId"
+            JOIN contributions c ON c.id = a."contributionId"
+            WHERE d."userId" = ${userId} AND d.status = 'CONFIRMED'::"DepositRecordStatus"
+              AND c.fund = 'SAVINGS'::"FundType" AND d."groupId" IN (${Prisma.join(groupIds)})
+              AND COALESCE(d."reviewedAt", d."createdAt") >= ${start}
+            GROUP BY 1`);
+    const before =
+      groupIds.length === 0
+        ? 0
+        : roundMoney(
+            decN(
+              (
+                await this.prisma.contribution.aggregate({
+                  where: {
+                    userId,
+                    groupId: { in: groupIds },
+                    fund: FundType.SAVINGS,
+                  },
+                  _sum: { amountPaid: true },
+                })
+              )._sum.amountPaid,
+            ) - monthly.reduce((a, x) => a + Number(x.s), 0),
+          );
+    let running = before;
+    const savingsSeries = Array.from({ length: 12 }, (_, i) => {
+      const key = new Date(
+        Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i, 1),
+      )
+        .toISOString()
+        .slice(0, 7);
+      const saved = roundMoney(
+        monthly
+          .filter((x) => new Date(x.m).toISOString().slice(0, 7) === key)
+          .reduce((a, x) => a + Number(x.s), 0),
+      );
+      running = roundMoney(running + saved);
+      return { month: key, saved, total: running };
+    });
+    const meetings =
+      groupIds.length === 0
+        ? []
+        : await this.prisma.meeting.findMany({
+            where: {
+              groupId: { in: groupIds },
+              status: 'SCHEDULED',
+              scheduledAt: {
+                gte: now,
+                lte: new Date(now.getTime() + 60 * 86_400_000),
+              },
+            },
+            include: { group: { select: { name: true } } },
+            orderBy: { scheduledAt: 'asc' },
+            take: 10,
+          });
+    const balances = new Map(summary.groupBalances.map((b) => [b.groupId, b]));
+    const nextDueByGroup = new Map<string, (typeof upcoming.items)[number]>();
+    for (const it of [...upcoming.items].sort((a, b) =>
+      a.dueDate.localeCompare(b.dueDate),
+    )) {
+      if (it.status === 'PENDING_CONFIRMATION') continue;
+      if (!nextDueByGroup.has(it.groupId)) nextDueByGroup.set(it.groupId, it);
+    }
+    const groups = memberships.map((m) => {
+      const b = balances.get(m.groupId);
+      const next = nextDueByGroup.get(m.groupId);
+      return {
+        id: m.groupId,
+        name: m.group.name,
+        role: m.role.name,
+        isVerified: m.group.isVerified,
+        memberCount: m.group._count.userGroups,
+        mySavings: b?.totalContributed ?? 0,
+        socialFund: b?.socialFundContributed ?? 0,
+        loanOutstanding: b?.loanOutstanding ?? 0,
+        openFines: b?.openFines ?? 0,
+        arrears: b?.arrears ?? 0,
+        nextDue: next
+          ? {
+              amount: next.amount,
+              dueDate: next.dueDate,
+              description: next.description,
+              status: next.status,
+            }
+          : null,
+      };
+    });
+    const sum = (
+      k:
+        | 'mySavings'
+        | 'socialFund'
+        | 'loanOutstanding'
+        | 'openFines'
+        | 'arrears',
+    ) => roundMoney(groups.reduce((a, g) => a + g[k], 0));
+    const dueItems = upcoming.items.filter(
+      (i) => i.status !== 'PENDING_CONFIRMATION',
+    );
+    return {
+      user,
+      totals: {
+        groups: groups.length,
+        savings: sum('mySavings'),
+        socialFund: sum('socialFund'),
+        loanOutstanding: sum('loanOutstanding'),
+        openFines: sum('openFines'),
+        overdue: roundMoney(
+          dueItems
+            .filter((i) => i.status === 'OVERDUE')
+            .reduce((a, i) => a + i.amount, 0),
+        ),
+        dueNext30Days: roundMoney(
+          dueItems
+            .filter(
+              (i) =>
+                new Date(i.dueDate).getTime() <=
+                now.getTime() + 30 * 86_400_000,
+            )
+            .reduce((a, i) => a + i.amount, 0),
+        ),
+      },
+      groups,
+      upcoming: [...upcoming.items]
+        .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+        .slice(0, 8),
+      recent: history.items,
+      savingsSeries,
+      meetings: meetings.map((mt) => ({
+        id: mt.id,
+        groupId: mt.groupId,
+        groupName: mt.group.name,
+        title: mt.title,
+        scheduledAt: mt.scheduledAt.toISOString(),
+        location: mt.location,
+      })),
     };
   }
 }

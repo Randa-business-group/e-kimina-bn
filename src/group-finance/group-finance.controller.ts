@@ -7,7 +7,9 @@ import {
   ParseBoolPipe,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import {
   ApiBearerAuth,
   ApiCreatedResponse,
@@ -38,9 +40,11 @@ import {
   IssueFineDto,
   ListFinesQueryDto,
   ManualDisbursementDto,
+  GuaranteeResponseDto,
   ReasonDto,
 } from './dto/finance-actions.dto';
 import { FinesService } from './fines.service';
+import { LoanExtrasService } from './loan-extras.service';
 import { FinanceJobsService } from './finance-jobs.service';
 
 @ApiTags('group-finance')
@@ -52,6 +56,7 @@ export class GroupFinanceController {
     private readonly groupLoans: GroupLoansService,
     private readonly fines: FinesService,
     private readonly jobs: FinanceJobsService,
+    private readonly loanExtras: LoanExtrasService,
   ) {}
 
   @Get('deposit-preview')
@@ -99,6 +104,7 @@ export class GroupFinanceController {
       proofImageUrl: dto.proofImageUrl,
       memberLoanId: dto.memberLoanId,
       includeLoanRepayment: dto.includeLoanRepayment,
+      earlyPayoff: dto.earlyPayoff,
       idempotencyKey: dto.idempotencyKey ?? idempotencyHeader,
     });
   }
@@ -195,8 +201,11 @@ export class GroupFinanceController {
   loanRequestPreview(
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
+    @Query('topUpOfLoanId') topUpOfLoanId?: string,
   ) {
-    return this.groupFinance.getLoanRequestPreview(user.id, groupId);
+    return this.groupFinance.getLoanRequestPreview(user.id, groupId, {
+      topUpOfLoanId: topUpOfLoanId?.trim() || undefined,
+    });
   }
 
   @Post('loan-applications')
@@ -210,12 +219,12 @@ export class GroupFinanceController {
     @CurrentUser() user: AuthenticatedUser,
     @Param('groupId') groupId: string,
     @Body() dto: CreateLoanApplicationDto,
+    @Headers('idempotency-key') idempotencyHeader?: string,
   ) {
-    return this.groupFinance.createLoanApplication(
-      user.id,
-      groupId,
-      dto.requestedAmount,
-    );
+    return this.groupFinance.createLoanApplication(user.id, groupId, {
+      ...dto,
+      idempotencyKey: dto.idempotencyKey ?? idempotencyHeader,
+    });
   }
 
   @Get('loan-repayment-preview')
@@ -464,5 +473,104 @@ export class GroupFinanceController {
   @ApiParam({ name: 'groupId', type: String })
   runJobs(@Param('groupId') groupId: string) {
     return this.jobs.runDaily(groupId);
+  }
+
+  // ── loans: applications, guarantors, statements (msfts §4) ──────────────
+
+  @Post('loan-applications/:applicationId/cancel')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({ summary: 'Withdraw your own pending loan application' })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'applicationId', type: String })
+  cancelLoanApplication(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('applicationId') applicationId: string,
+  ) {
+    return this.loanExtras.cancelApplication(user.id, groupId, applicationId);
+  }
+
+  @Get('guarantees/mine')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({ summary: 'Guarantees other members asked of you' })
+  @ApiParam({ name: 'groupId', type: String })
+  myGuarantees(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+  ) {
+    return this.loanExtras.myGuarantees(user.id, groupId);
+  }
+
+  @Post('guarantees/:guaranteeId/respond')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({
+    summary:
+      'Accept or decline guaranteeing a loan (accepting locks that much of your savings)',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'guaranteeId', type: String })
+  respondGuarantee(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('guaranteeId') guaranteeId: string,
+    @Body() dto: GuaranteeResponseDto,
+  ) {
+    return this.loanExtras.respond(user.id, groupId, guaranteeId, dto.accept);
+  }
+
+  @Post('member-loans/:memberLoanId/guarantees/call')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER)
+  @ApiOperation({
+    summary:
+      'Defaulted / written-off loan: guarantors owe their share of the balance',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  callGuarantees(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+  ) {
+    return this.loanExtras.callGuarantees(user.id, groupId, memberLoanId);
+  }
+
+  @Get('member-loans/:memberLoanId/statement')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({
+    summary:
+      'Loan statement: schedule (amortization), payments, payout, guarantors',
+  })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  loanStatement(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+  ) {
+    return this.loanExtras.statement(user.id, groupId, memberLoanId);
+  }
+
+  @Get('member-loans/:memberLoanId/statement.pdf')
+  @GroupRole(RoleName.GROUP_ADMIN, RoleName.TREASURER, RoleName.MEMBER)
+  @ApiOperation({ summary: 'Loan statement as PDF' })
+  @ApiParam({ name: 'groupId', type: String })
+  @ApiParam({ name: 'memberLoanId', type: String })
+  async loanStatementPdf(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('groupId') groupId: string,
+    @Param('memberLoanId') memberLoanId: string,
+    @Res() res: Response,
+  ) {
+    const pdf = await this.loanExtras.statementPdf(
+      user.id,
+      groupId,
+      memberLoanId,
+    );
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="loan-statement-${memberLoanId}.pdf"`,
+    );
+    res.send(pdf);
   }
 }

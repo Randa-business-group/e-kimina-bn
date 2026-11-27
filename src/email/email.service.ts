@@ -1,4 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { JobQueueService, PermanentJobError } from '../jobs/job-queue.service';
 import * as nodemailer from 'nodemailer';
 import { Transporter } from 'nodemailer';
 import { getEmailConfig } from './email.config.js';
@@ -7,18 +8,27 @@ import { renderVerificationEmail } from './templates/email-verification.template
 import { renderPasswordResetEmail } from './templates/password-reset.template.js';
 import { renderMemberInvitationEmail } from './templates/member-invitation.template.js';
 import { renderTreasurerInvitationEmail } from './templates/treasurer-invitation.template.js';
-import { renderVendorCreatedEmail } from './templates/vendor-created.template.js';
 import { renderPaymentDepositConfirmedEmail } from './templates/payment-deposit-confirmed.template.js';
 import { renderPaymentDepositRejectedEmail } from './templates/payment-deposit-rejected.template.js';
 import { renderManualDepositAuditGroupAdminEmail } from './templates/payment-manual-audit-superadmin.template.js';
 import { renderManualDepositPendingGroupAdminEmail } from './templates/payment-manual-pending-superadmin.template.js';
 
 @Injectable()
-export class EmailService {
+export class EmailService implements OnModuleInit {
   private readonly logger = new Logger(EmailService.name);
   private transporter: Transporter;
 
-  constructor() {
+  onModuleInit() {
+    // Queued emails are sent by the job worker with retries (msfts §10).
+    this.queue.register('email.send', async (p) => {
+      if (!getEmailConfig().smtp.host.trim()) {
+        throw new PermanentJobError('SMTP is not configured.');
+      }
+      await this.deliverNow(p as unknown as EmailOptions);
+    });
+  }
+
+  constructor(private readonly queue: JobQueueService) {
     const config = getEmailConfig();
 
     this.transporter = nodemailer.createTransport({
@@ -41,6 +51,31 @@ export class EmailService {
     }
   }
 
+  private smtpCheck: { at: number; ok: boolean; error?: string } | null = null;
+
+  /** SMTP reachability for health checks (cached for a minute). */
+  async smtpHealth(): Promise<{
+    status: 'up' | 'down' | 'disabled';
+    error?: string;
+  }> {
+    if (!getEmailConfig().smtp.host.trim()) return { status: 'disabled' };
+    if (!this.smtpCheck || Date.now() - this.smtpCheck.at > 60_000) {
+      try {
+        await this.transporter.verify();
+        this.smtpCheck = { at: Date.now(), ok: true };
+      } catch (e) {
+        this.smtpCheck = {
+          at: Date.now(),
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    }
+    return this.smtpCheck.ok
+      ? { status: 'up' }
+      : { status: 'down', error: this.smtpCheck.error };
+  }
+
   private async verifyConnection(): Promise<void> {
     try {
       await this.transporter.verify();
@@ -53,7 +88,26 @@ export class EmailService {
     }
   }
 
-  async sendEmail(options: EmailOptions): Promise<void> {
+  /**
+   * Queues an email (sent by the job worker, retried on failure). `immediate` sends it inside
+   * the request instead — used for one-time codes, where the caller must know it went out.
+   */
+  async sendEmail(
+    options: EmailOptions,
+    opts: { immediate?: boolean } = {},
+  ): Promise<void> {
+    if (!getEmailConfig().smtp.host.trim()) {
+      throw new Error('SMTP is not configured. Set SMTP_* in .env.');
+    }
+    if (opts.immediate || !this.queue.workerEnabled) {
+      await this.deliverNow(options);
+      return;
+    }
+    await this.queue.enqueue('email.send', { ...options });
+  }
+
+  /** Sends through SMTP now. */
+  async deliverNow(options: EmailOptions): Promise<void> {
     const config = getEmailConfig();
 
     if (!config.smtp.host.trim()) {
@@ -95,35 +149,14 @@ export class EmailService {
     const html = renderVerificationEmail(otp, name);
     const config = getEmailConfig();
 
-    await this.sendEmail({
-      to: email,
-      subject: `Verify your ${config.appName} account`,
-      html,
-    });
-  }
-
-  async sendVendorCreatedEmail(
-    email: string,
-    vendorName: string,
-    vendorSlug: string,
-    name?: string,
-    password?: string,
-  ): Promise<void> {
-    const config = getEmailConfig();
-    const html = renderVendorCreatedEmail(
-      vendorName,
-      vendorSlug,
-      config.frontendUrl,
-      email,
-      name,
-      password,
+    await this.sendEmail(
+      {
+        to: email,
+        subject: `Verify your ${config.appName} account`,
+        html,
+      },
+      { immediate: true },
     );
-
-    await this.sendEmail({
-      to: email,
-      subject: `Welcome to ${config.appName} - ${vendorName}`,
-      html,
-    });
   }
 
   async sendTreasurerInvitationEmail(
@@ -163,11 +196,14 @@ export class EmailService {
   ): Promise<void> {
     const html = renderPasswordResetEmail(otp, email, name);
     const config = getEmailConfig();
-    await this.sendEmail({
-      to: email,
-      subject: `Reset your ${config.appName} password`,
-      html,
-    });
+    await this.sendEmail(
+      {
+        to: email,
+        subject: `Reset your ${config.appName} password`,
+        html,
+      },
+      { immediate: true },
+    );
   }
 
   async sendManualDepositConfirmedEmail(
